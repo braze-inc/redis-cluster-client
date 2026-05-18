@@ -9,6 +9,7 @@ require 'cluster_controller'
 require 'middlewares/command_capture'
 require 'middlewares/redirect_count'
 require 'middlewares/redirect_fake'
+require 'middlewares/cluster_down_read_inject'
 
 case ENV.fetch('REDIS_CONNECTION_DRIVER', 'ruby')
 when 'hiredis' then require 'hiredis-client'

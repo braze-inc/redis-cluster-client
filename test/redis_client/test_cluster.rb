@@ -206,6 +206,37 @@ class RedisClient
         10.times { |i| assert_equal((i + 10).to_s, @client.call('GET', "string#{i}")) }
       end
 
+      def test_pipelined_raises_on_clusterdown
+        target_command = %w[GET cluster-down-key]
+        renewed = false
+        @client.instance_variable_get(:@router)
+
+        with_clusterdown_injected_on(target_command) do
+          error = assert_raises(::RedisClient::CommandError) do
+            @client.pipelined do |pipeline|
+              pipeline.call('GET', 'ok-key')
+              pipeline.call('GET', 'cluster-down-key')
+            end
+          end
+
+          assert_match(/^CLUSTERDOWN/, error.message)
+        end
+      end
+
+      def test_pipelined_with_clusterdown_as_is
+        target_command = %w[GET cluster-down-key]
+
+        got = with_clusterdown_injected_on(target_command) do
+          @client.pipelined(exception: false) do |pipeline|
+            pipeline.call('GET', 'ok-key')
+            pipeline.call('GET', 'cluster-down-key')
+          end
+        end
+
+        assert_instance_of(::RedisClient::CommandError, got[1])
+        assert_match(/^CLUSTERDOWN/, got[1].message)
+      end
+
       def test_pipelined_with_many_commands
         @client.pipelined { |pi| 1000.times { |i| pi.call('SET', i, i) } }
         wait_for_replication
@@ -1052,6 +1083,10 @@ class RedisClient
       def hiredis_used?
         ::RedisClient.const_defined?(:HiredisConnection) &&
           ::RedisClient.default_driver == ::RedisClient::HiredisConnection
+      end
+
+      def with_clusterdown_injected_on(command, &block)
+        ::Middlewares::ClusterDownReadInject.with(command, &block)
       end
     end
 
