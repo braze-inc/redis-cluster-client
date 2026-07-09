@@ -2,6 +2,7 @@
 
 require 'logger'
 require 'json'
+require 'open3'
 require 'testing_helper'
 require 'securerandom'
 
@@ -28,7 +29,7 @@ class TestAgainstClusterBroken < TestingWrapper
   def teardown
     @logger.info('teardown: test')
     revive_dead_nodes
-    @clients.each(&:close)
+    @clients&.each(&:close)
     @controller&.close
   end
 
@@ -252,14 +253,9 @@ class TestAgainstClusterBroken < TestingWrapper
     log_info("kill #{sacrifice.config.host}:#{sacrifice.config.port}") do
       refute_nil(sacrifice, "#{sacrifice.config.host}:#{sacrifice.config.port}")
 
-      `docker compose ps --format json`.lines.map { |line| JSON.parse(line) }.each do |service|
-        published_ports = service.fetch('Publishers').map { |e| e.fetch('PublishedPort') }.uniq
-        next unless published_ports.include?(sacrifice.config.port)
-
-        service_name = service.fetch('Service')
-        system("docker compose --progress quiet pause #{service_name}", exception: true)
-        break
-      end
+      container_name = compose_container_name_for_sacrifice(sacrifice)
+      refute_nil(container_name, "no compose container for #{sacrifice.config.host}:#{sacrifice.config.port}")
+      container_run('pause', container_name)
 
       assert_raises(::RedisClient::ConnectionError) { sacrifice.call_once('PING') }
     end
@@ -267,11 +263,51 @@ class TestAgainstClusterBroken < TestingWrapper
 
   def revive_dead_nodes
     log_info('revive dead nodes') do
-      `docker compose ps --format json --status paused`.lines.map { |line| JSON.parse(line) }.each do |service|
-        service_name = service.fetch('Service')
-        system("docker compose --progress quiet unpause #{service_name}", exception: true)
+      compose_capture('ps', '--format', 'json', '--status', 'paused').lines.each do |line|
+        container_name = JSON.parse(line).fetch('Name')
+        container_run('unpause', container_name)
       end
     end
+  end
+
+  def compose_container_name_for_sacrifice(sacrifice)
+    service_name = compose_service_name_for_sacrifice(sacrifice)
+    return if service_name.nil?
+
+    compose_services.find { |service| service.fetch('Service') == service_name }&.fetch('Name')
+  end
+
+  def compose_service_name_for_sacrifice(sacrifice)
+    host = sacrifice.config.host
+    port = sacrifice.config.port
+
+    return host if host.match?(/\Anode\d+\z/)
+
+    compose_services.find do |service|
+      next false unless host == '127.0.0.1' || host == 'localhost'
+
+      published_ports = service.fetch('Publishers', []).map { |e| e.fetch('PublishedPort') }.uniq
+      published_ports.include?(port)
+    end&.fetch('Service')
+  end
+
+  def compose_services
+    compose_capture('ps', '--format', 'json').lines.map { |line| JSON.parse(line) }
+  end
+
+  def compose_run(*args)
+    system('docker', 'compose', '--progress', 'quiet', *args, exception: true)
+  end
+
+  def container_run(*args)
+    system('docker', *args, exception: true)
+  end
+
+  def compose_capture(*args)
+    stdout, status = Open3.capture2('docker', 'compose', '--progress', 'quiet', *args)
+    raise "compose command failed: docker compose #{args.join(' ')}" unless status.success?
+
+    stdout
   end
 
   def log_info(message)
