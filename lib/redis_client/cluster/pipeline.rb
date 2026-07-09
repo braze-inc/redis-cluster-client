@@ -207,7 +207,7 @@ class RedisClient
           end
         end
 
-        all_replies = errors = required_redirections = cluster_state_errors = nil
+        all_replies = errors = required_redirections = cluster_state_errors = cluster_connection_errors = nil
 
         work_group.each do |node_key, v|
           case v
@@ -218,9 +218,14 @@ class RedisClient
             cluster_state_errors ||= {}
             cluster_state_errors[node_key] = v
           when StandardError
-            cluster_state_errors ||= {} if v.is_a?(::RedisClient::ConnectionError)
-            errors ||= {}
-            errors[node_key] = v
+            if v.is_a?(::RedisClient::ConnectionError)
+              cluster_state_errors ||= {}
+              cluster_connection_errors ||= {}
+              cluster_connection_errors[node_key] = v
+            else
+              errors ||= {}
+              errors[node_key] = v
+            end
           else
             all_replies ||= Array.new(@size)
             @pipelines[node_key].outer_indices.each_with_index do |outer, inner|
@@ -238,7 +243,12 @@ class RedisClient
         end
 
         work_group.close
-        @router.renew_cluster_state if cluster_state_errors
+        @router.renew_cluster_state if cluster_state_errors || cluster_connection_errors
+
+        cluster_connection_errors&.each do |node_key, _connection_error|
+          required_redirections ||= {}
+          required_redirections[node_key] = build_connection_error_redirection(node_key)
+        end
 
         required_redirections&.each do |node_key, v|
           all_replies ||= Array.new(@size)
@@ -333,6 +343,59 @@ class RedisClient
 
       def find_multi_exec_segment(node_key, inner_index)
         (@multi_exec_segments[node_key] || []).find { |segment| segment.include?(inner_index) }
+      end
+
+      def build_connection_error_redirection(node_key)
+        pipeline = @pipelines[node_key]
+        redirection = RedirectionNeeded.new
+        redirection.replies = Array.new(pipeline._size)
+        redirection.indices = []
+        redirected_segments = Set.new
+
+        pipeline._size.times do |inner_index|
+          segment = find_multi_exec_segment(node_key, inner_index)
+          if segment
+            segment_key = [node_key, segment.begin, segment.end]
+            next if redirected_segments.include?(segment_key)
+
+            redirected_segments.add(segment_key)
+            inner_index = connection_error_redirection_index(pipeline, segment)
+          end
+
+          command = pipeline.get_command(inner_index)
+          new_node_key = @router.find_node_key(command, seed: @seed)
+          next if new_node_key.nil?
+
+          slot = slot_for_redirection(pipeline, inner_index, node_key)
+          redirection.replies[inner_index] = ::RedisClient::CommandError.new("MOVED #{slot} #{new_node_key}")
+          redirection.indices << inner_index
+        end
+
+        redirection
+      end
+
+      def connection_error_redirection_index(pipeline, segment)
+        segment.each do |i|
+          new_node_key = @router.find_node_key(pipeline.get_command(i), seed: @seed)
+          return i unless new_node_key.nil?
+        end
+
+        segment.begin
+      end
+
+      def slot_for_redirection(pipeline, inner_index, node_key)
+        slot = @router.find_slot(pipeline.get_command(inner_index))
+        return slot unless slot.nil?
+
+        segment = find_multi_exec_segment(node_key, inner_index)
+        if segment
+          segment.each do |i|
+            slot = @router.find_slot(pipeline.get_command(i))
+            return slot unless slot.nil?
+          end
+        end
+
+        0
       end
 
       def try_redirection(node_key, node, pipeline, inner_index)
