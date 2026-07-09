@@ -70,6 +70,55 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal 'OK', @clients[0].call('SET', test_key, 'foobar2')
   end
 
+  def test_pipeline_reloading_on_connection_error
+    keys = 12.times.map { |i| "pipeline_reload:#{i}" }
+
+    keys.each { |key| @clients[0].call('SET', key, 'initial') }
+    wait_for_reload_jitter_elapsed(@clients[0])
+
+    sacrifice = @controller.select_sacrifice_of_primary
+    kill_a_node_and_wait_for_failover(sacrifice)
+
+    @captured_commands.clear
+    want = keys.map { 'OK' }
+    got = @clients[0].pipelined do |pi|
+      keys.each { |key| pi.call('SET', key, 'updated') }
+    end
+    assert_equal(want, got)
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    refute(@captured_commands.count('cluster', subcmd).zero?)
+
+    want = keys.map { 'updated' }
+    got = @clients[0].pipelined do |pi|
+      keys.each { |key| pi.call('GET', key) }
+    end
+    assert_equal(want, got)
+  end
+
+  def test_pipeline_multi_retry_on_connection_error
+    sacrifice = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(sacrifice)
+    @clients[0].call('SET', test_key, '5')
+    wait_for_reload_jitter_elapsed(@clients[0])
+
+    kill_a_node_and_wait_for_failover(sacrifice)
+
+    @captured_commands.clear
+    assert_raises(::RedisClient::CommandError) do
+      @clients[0].pipelined do |pi|
+        pi.multi do |multi|
+          multi.call('SET', test_key, '0', 'too many args')
+          multi.call('INCR', test_key)
+        end
+      end
+    end
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    refute(@captured_commands.count('cluster', subcmd).zero?)
+    assert_equal('5', @clients[0].call('GET', test_key))
+  end
+
   def test_transaction_retry_on_connection_error
     sacrifice = @controller.select_sacrifice_of_primary
     # Find a key which lives on the sacrifice node
