@@ -351,6 +351,67 @@ class RedisClient
         client&.close
       end
 
+      def test_pipelined_transaction_redirect_replays_segment_via_call_pipelined
+        key = 'tx_pipelined_replay_key'
+        slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+        router = @client.instance_variable_get(:@router)
+        target_node_key = router.find_node_key_by_key(key, primary: true)
+        captured_commands = ::Middlewares::CommandCapture::CommandBuffer.new
+        redirect_count = ::Middlewares::RedirectCount::Counter.new
+
+        client = new_test_client(
+          middlewares: [
+            ::Middlewares::RedirectReadInject,
+            ::Middlewares::CommandCapture
+          ],
+          custom: {
+            captured_commands: captured_commands,
+            redirect_count: redirect_count,
+            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
+              slot: slot,
+              to: target_node_key,
+              command: %w[SET tx_pipelined_replay_key 0],
+              once: true
+            )
+          }
+        )
+
+        ::Middlewares::RedirectReadInject.with do
+          ::Middlewares::MultiExecOnly.with do
+            got = client.pipelined do |pipeline|
+              pipeline.multi do |multi|
+                multi.call('SET', key, '0')
+                multi.call('INCR', key)
+              end
+            end
+
+            refute(redirect_count.zero?, redirect_count.get)
+            assert_instance_of(Array, got[0], 'pipelined multi result must be an EXEC array, not a scalar reply')
+            assert_equal(['OK', 1], got[0])
+
+            pipelined_segments = pipelined_multi_segments_on(captured_commands)
+            successful_segments = pipelined_segments.select do |segment|
+              segment.size >= 4 &&
+                segment[0].command[0].downcase == 'multi' &&
+                segment[-1].command[0].downcase == 'exec' &&
+                segment.any? { |c| c.command[0].downcase == 'set' && c.command[1] == key && c.command[2] == '0' } &&
+                segment.any? { |c| c.command[0].downcase == 'incr' && c.command[1] == key }
+            end
+            refute_empty(successful_segments, 'redirect replay must resend MULTI..EXEC via call_pipelined')
+
+            non_pipelined = captured_commands.to_a.select do |c|
+              !c.pipelined &&
+                %w[set incr exec].include?(c.command[0].downcase) &&
+                c.command[1] == key
+            end
+            assert_empty(non_pipelined, 'redirect replay must not resend transaction commands individually')
+            assert_equal('1', client.call('GET', key))
+          end
+        end
+      ensure
+        client&.close
+      end
+
       def test_pipelined_transaction_redirects_on_moved_with_errors
         key = 'tx_redirect_err_key'
         slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
@@ -1169,6 +1230,25 @@ class RedisClient
           # FIXME: flaky in jruby on #test_pubsub_with_wrong_command
           raise unless e.errors.values.all? { |err| err.is_a?(::RedisClient::ConnectionError) }
         end
+      end
+
+      def pipelined_multi_segments_on(captured_commands)
+        pipelined = captured_commands.to_a.select(&:pipelined)
+        segments = []
+        index = 0
+        while index < pipelined.size
+          if pipelined[index].command[0].downcase == 'multi'
+            segment_end = index + 1
+            segment_end += 1 while segment_end < pipelined.size && pipelined[segment_end].command[0].downcase != 'exec'
+            if segment_end < pipelined.size && pipelined[segment_end].command[0].downcase == 'exec'
+              segments << pipelined[index..segment_end]
+            end
+            index = segment_end + 1
+          else
+            index += 1
+          end
+        end
+        segments
       end
 
       def collect_messages(pubsub, size:, max_attempts: 30, timeout: 1.0)
