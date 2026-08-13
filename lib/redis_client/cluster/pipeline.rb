@@ -261,13 +261,18 @@ class RedisClient
               next if redirected_segments.include?(key)
 
               redirected_segments.add(key)
-              v.replies[segment.end] = handle_redirection(node_key, v.replies[i], pipeline, i).map do |result|
-                if @exception && result.is_a?(::RedisClient::CommandError)
-                  errors ||= {}
-                  errors[node_key] = result
-                end
-                result
-              end
+              redirected = handle_redirection(node_key, v.replies[i], pipeline, i)
+              v.replies[segment.end] = if redirected.is_a?(Array)
+                                         redirected.map do |result|
+                                           if @exception && result.is_a?(::RedisClient::CommandError)
+                                             errors ||= {}
+                                             errors[node_key] = result
+                                           end
+                                           result
+                                         end
+                                       else
+                                         redirected
+                                       end
             else
               v.replies[i] = handle_redirection(node_key, v.replies[i], pipeline, i)
             end
@@ -325,6 +330,41 @@ class RedisClient
         end
 
         pipeline._coerce!(results)
+      end
+
+      def send_multi_exec_segment(node, commands, blocks)
+        case node
+        when ::RedisClient then send_multi_exec_segment_pipeline(node, commands, blocks)
+        when ::RedisClient::Pooled then node.with { |cli| send_multi_exec_segment_pipeline(cli, commands, blocks) }
+        else raise NotImplementedError, "#{node.class.name}#redirect_multi_exec_segment"
+        end
+      end
+
+      def send_multi_exec_segment_pipeline(client, commands, blocks)
+        replies = client.ensure_connected_cluster_scoped do |connection|
+          client.middlewares.call_pipelined(commands, client.config) do
+            connection.call_pipelined(commands, nil)
+          end
+        end
+
+        exec_reply = replies.last
+        return exec_reply unless exec_reply.is_a?(Array)
+
+        coerce_multi_exec_segment_results!(exec_reply, commands, blocks)
+      end
+
+      def coerce_multi_exec_segment_results!(results, commands, blocks)
+        results.each_with_index do |result, index|
+          if result.is_a?(::RedisClient::CommandError)
+            result._set_command(commands[index + 1])
+            next
+          end
+
+          block = blocks[index + 1]
+          results[index] = block.call(result) unless block.nil?
+        end
+
+        results
       end
 
       def handle_redirection(node_key, err, pipeline, inner_index)
@@ -410,9 +450,9 @@ class RedisClient
       end
 
       def redirect_multi_exec_segment(node, pipeline, segment)
-        segment.map do |inner_index|
-          redirect_command(node, pipeline, inner_index)
-        end.last
+        commands = segment.map { |inner_index| pipeline.get_command(inner_index) }
+        blocks = segment.map { |inner_index| pipeline.get_block(inner_index) }
+        send_multi_exec_segment(node, commands, blocks)
       end
 
       def redirect_command(node, pipeline, inner_index)
