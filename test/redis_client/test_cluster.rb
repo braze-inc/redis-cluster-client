@@ -164,7 +164,7 @@ class RedisClient
       end
 
       def test_pipelined_with_errors
-        assert_raises(RedisClient::Cluster::ErrorCollection) do
+        err = assert_raises(RedisClient::Cluster::ErrorCollection) do
           @client.pipelined do |pipeline|
             10.times do |i|
               pipeline.call('SET', "string#{i}", i)
@@ -172,6 +172,11 @@ class RedisClient
               pipeline.call('SET', "string#{i}", i + 10)
             end
           end
+        end
+
+        refute_empty(err.errors)
+        err.errors.each_value do |e|
+          assert_instance_of(::RedisClient::CommandError, e)
         end
 
         wait_for_replication
@@ -219,6 +224,288 @@ class RedisClient
 
         wait_for_replication
         assert_equal('2', @client.call('GET', 'counter'))
+      end
+
+      def test_pipelined_transactions
+        got = @client.pipelined do |pipeline|
+          10.times do |i|
+            pipeline.multi do |multi|
+              multi.call('INCR', "string#{i}")
+              multi.call('INCRBY', "string#{i}", 2)
+            end
+          end
+        end
+        assert_equal(Array.new(10) { [1, 3] }, got)
+      end
+
+      def test_pipelined_transactions_with_multiple_key
+        assert_raises(::RedisClient::Cluster::Transaction::ConsistencyError) do
+          @client.pipelined do |pipeline|
+            pipeline.multi do |multi|
+              multi.call('SET', 'key1', '1')
+              multi.call('SET', 'key2', '2')
+              multi.call('SET', 'key3', '3')
+            end
+          end
+        end
+
+        (1..3).each do |i|
+          assert_nil(@client.call('GET', "key#{i}"))
+        end
+      end
+
+      def test_pipelined_transactions_with_command_errors
+        err = assert_raises(::RedisClient::Cluster::ErrorCollection) do
+          @client.pipelined do |pipeline|
+            10.times do |i|
+              pipeline.multi do |multi|
+                multi.call('SET', "string#{i}", i)
+                multi.call('SET', "string#{i}", i, 'too many args')
+                multi.call('SET', "string#{i}", i + 10)
+              end
+            end
+          end
+        end
+
+        refute_empty(err.errors)
+        err.errors.each_value do |e|
+          assert_instance_of(::RedisClient::CommandError, e)
+        end
+
+        wait_for_replication
+
+        10.times do |i|
+          assert_equal((i + 10).to_s, @client.call('GET', "string#{i}"))
+        end
+      end
+
+      def test_pipelined_transactions_with_command_errors_as_is
+        got = @client.pipelined(exception: false) do |pipeline|
+          10.times do |i|
+            pipeline.multi do |multi|
+              multi.call('SET', "string#{i}", i)
+              multi.call('SET', "string#{i}", i, 'too many args')
+              multi.call('SET', "string#{i}", i + 10)
+            end
+          end
+        end
+
+        assert_equal(10, got.size)
+        got.each do |result|
+          assert_equal('OK', result[0])
+          assert_instance_of(::RedisClient::CommandError, result[1])
+          assert_equal('OK', result[2])
+        end
+
+        wait_for_replication
+
+        10.times do |i|
+          assert_equal((i + 10).to_s, @client.call('GET', "string#{i}"))
+        end
+      end
+
+      def test_pipelined_transaction_redirects_on_moved
+        key = 'tx_redirect_key'
+        slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+        router = @client.instance_variable_get(:@router)
+        target_node_key = router.find_node_key_by_key(key, primary: true)
+        redirect_count = ::Middlewares::RedirectCount::Counter.new
+
+        client = new_test_client(
+          middlewares: [
+            ::Middlewares::RedirectReadInject
+          ],
+          custom: {
+            redirect_count: redirect_count,
+            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
+              slot: slot,
+              to: target_node_key,
+              command: %w[SET tx_redirect_key 0],
+              once: true
+            )
+          }
+        )
+
+        got = nil
+        ::Middlewares::RedirectReadInject.with do
+          ::Middlewares::MultiExecOnly.with do
+            got = client.pipelined do |pipeline|
+              pipeline.call('SET', 'decoy', 'must-not-appear')
+              pipeline.multi do |multi|
+                multi.call('SET', key, '0')
+                multi.call('INCR', key)
+              end
+              pipeline.call('GET', 'decoy')
+            end
+          end
+        end
+
+        refute(redirect_count.zero?, redirect_count.get)
+        assert_equal(3, got.size)
+        assert_nil(got[0], 'decoy SET is dropped by MultiExecOnly and not sent to Redis')
+        assert_equal(['OK', 1], got[1])
+        assert_nil(got[2], 'decoy GET is dropped by MultiExecOnly and not sent to Redis')
+        assert_nil(client.call('GET', 'decoy'))
+        assert_equal('1', client.call('GET', key))
+      ensure
+        client&.close
+      end
+
+      def test_pipelined_transaction_redirect_replays_segment_via_call_pipelined
+        key = 'tx_pipelined_replay_key'
+        slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+        router = @client.instance_variable_get(:@router)
+        target_node_key = router.find_node_key_by_key(key, primary: true)
+        captured_commands = ::Middlewares::CommandCapture::CommandBuffer.new
+        redirect_count = ::Middlewares::RedirectCount::Counter.new
+
+        client = new_test_client(
+          middlewares: [
+            ::Middlewares::RedirectReadInject,
+            ::Middlewares::CommandCapture
+          ],
+          custom: {
+            captured_commands: captured_commands,
+            redirect_count: redirect_count,
+            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
+              slot: slot,
+              to: target_node_key,
+              command: %w[SET tx_pipelined_replay_key 0],
+              once: true
+            )
+          }
+        )
+
+        ::Middlewares::RedirectReadInject.with do
+          ::Middlewares::MultiExecOnly.with do
+            got = client.pipelined do |pipeline|
+              pipeline.multi do |multi|
+                multi.call('SET', key, '0')
+                multi.call('INCR', key)
+              end
+            end
+
+            refute(redirect_count.zero?, redirect_count.get)
+            assert_instance_of(Array, got[0], 'pipelined multi result must be an EXEC array, not a scalar reply')
+            assert_equal(['OK', 1], got[0])
+
+            pipelined_segments = pipelined_multi_segments_on(captured_commands)
+            successful_segments = pipelined_segments.select do |segment|
+              segment.size >= 4 &&
+                segment[0].command[0].downcase == 'multi' &&
+                segment[-1].command[0].downcase == 'exec' &&
+                segment.any? { |c| c.command[0].downcase == 'set' && c.command[1] == key && c.command[2] == '0' } &&
+                segment.any? { |c| c.command[0].downcase == 'incr' && c.command[1] == key }
+            end
+            refute_empty(successful_segments, 'redirect replay must resend MULTI..EXEC via call_pipelined')
+
+            non_pipelined = captured_commands.to_a.select do |c|
+              !c.pipelined &&
+                %w[set incr exec].include?(c.command[0].downcase) &&
+                c.command[1] == key
+            end
+            assert_empty(non_pipelined, 'redirect replay must not resend transaction commands individually')
+            assert_equal('1', client.call('GET', key))
+          end
+        end
+      ensure
+        client&.close
+      end
+
+      def test_pipelined_transaction_redirects_on_moved_with_errors
+        key = 'tx_redirect_err_key'
+        slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+        router = @client.instance_variable_get(:@router)
+        target_node_key = router.find_node_key_by_key(key, primary: true)
+        redirect_count = ::Middlewares::RedirectCount::Counter.new
+
+        client = new_test_client(
+          middlewares: [
+            ::Middlewares::RedirectReadInject
+          ],
+          custom: {
+            redirect_count: redirect_count,
+            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
+              slot: slot,
+              to: target_node_key,
+              command: %w[SET tx_redirect_err_key 0],
+              once: true
+            )
+          }
+        )
+
+        err = nil
+        ::Middlewares::RedirectReadInject.with do
+          ::Middlewares::MultiExecOnly.with do
+            err = assert_raises(::RedisClient::Cluster::ErrorCollection) do
+              client.pipelined do |pipeline|
+                pipeline.call('SET', 'decoy_err', 'must-not-appear')
+                pipeline.multi do |multi|
+                  multi.call('SET', key, '0')
+                  multi.call('SET', key, '0', 'too many args')
+                  multi.call('SET', key, '2')
+                end
+              end
+            end
+          end
+        end
+        refute(redirect_count.zero?, redirect_count.get)
+        assert_instance_of(::RedisClient::Cluster::ErrorCollection, err)
+        refute_empty(err.errors)
+        err.errors.each_value do |e|
+          assert_instance_of(::RedisClient::CommandError, e)
+        end
+        assert_nil(client.call('GET', 'decoy_err'))
+        assert_equal('2', client.call('GET', key))
+      ensure
+        client&.close
+      end
+
+      def test_pipelined_transaction_redirects_on_moved_as_is
+        key = 'tx_redirect_err_key'
+        slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+        router = @client.instance_variable_get(:@router)
+        target_node_key = router.find_node_key_by_key(key, primary: true)
+        redirect_count = ::Middlewares::RedirectCount::Counter.new
+
+        client = new_test_client(
+          middlewares: [
+            ::Middlewares::RedirectReadInject
+          ],
+          custom: {
+            redirect_count: redirect_count,
+            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
+              slot: slot,
+              to: target_node_key,
+              command: %w[SET tx_redirect_err_key 0],
+              once: true
+            )
+          }
+        )
+
+        ::Middlewares::RedirectReadInject.with do
+          ::Middlewares::MultiExecOnly.with do
+            got = client.pipelined(exception: false) do |pipeline|
+              pipeline.call('SET', 'decoy_err', 'must-not-appear')
+              pipeline.multi do |multi|
+                multi.call('SET', key, '0')
+                multi.call('SET', key, '0', 'too many args')
+                multi.call('SET', key, '2')
+              end
+            end
+
+            refute(redirect_count.zero?, redirect_count.get)
+            assert_equal(2, got.size)
+            assert_nil(got[0], 'decoy SET is dropped by MultiExecOnly and not sent to Redis')
+            assert_equal('OK', got[1][0])
+            assert_instance_of(::RedisClient::CommandError, got[1][1])
+            assert_equal('OK', got[1][2])
+            assert_nil(client.call('GET', 'decoy_err'))
+            assert_equal('2', client.call('GET', key))
+          end
+        end
+      ensure
+        client&.close
       end
 
       def test_transaction_with_multiple_key
@@ -943,6 +1230,25 @@ class RedisClient
           # FIXME: flaky in jruby on #test_pubsub_with_wrong_command
           raise unless e.errors.values.all? { |err| err.is_a?(::RedisClient::ConnectionError) }
         end
+      end
+
+      def pipelined_multi_segments_on(captured_commands)
+        pipelined = captured_commands.to_a.select(&:pipelined)
+        segments = []
+        index = 0
+        while index < pipelined.size
+          if pipelined[index].command[0].downcase == 'multi'
+            segment_end = index + 1
+            segment_end += 1 while segment_end < pipelined.size && pipelined[segment_end].command[0].downcase != 'exec'
+            if segment_end < pipelined.size && pipelined[segment_end].command[0].downcase == 'exec'
+              segments << pipelined[index..segment_end]
+            end
+            index = segment_end + 1
+          else
+            index += 1
+          end
+        end
+        segments
       end
 
       def collect_messages(pubsub, size:, max_attempts: 30, timeout: 1.0)
