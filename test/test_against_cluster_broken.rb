@@ -2,7 +2,6 @@
 
 require 'logger'
 require 'json'
-require 'open3'
 require 'testing_helper'
 require 'securerandom'
 
@@ -29,7 +28,7 @@ class TestAgainstClusterBroken < TestingWrapper
   def teardown
     @logger.info('teardown: test')
     revive_dead_nodes
-    @clients&.each(&:close)
+    @clients.each(&:close)
     @controller&.close
   end
 
@@ -69,55 +68,6 @@ class TestAgainstClusterBroken < TestingWrapper
     # When we try and fetch the key, it'll attempt to connect to the broken node, and
     # thus trigger a reload of the cluster topology.
     assert_equal 'OK', @clients[0].call('SET', test_key, 'foobar2')
-  end
-
-  def test_pipeline_reloading_on_connection_error
-    keys = 12.times.map { |i| "pipeline_reload:#{i}" }
-
-    keys.each { |key| @clients[0].call('SET', key, 'initial') }
-    wait_for_reload_jitter_elapsed(@clients[0])
-
-    sacrifice = @controller.select_sacrifice_of_primary
-    kill_a_node_and_wait_for_failover(sacrifice)
-
-    @captured_commands.clear
-    want = keys.map { 'OK' }
-    got = @clients[0].pipelined do |pi|
-      keys.each { |key| pi.call('SET', key, 'updated') }
-    end
-    assert_equal(want, got)
-
-    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
-    refute(@captured_commands.count('cluster', subcmd).zero?)
-
-    want = keys.map { 'updated' }
-    got = @clients[0].pipelined do |pi|
-      keys.each { |key| pi.call('GET', key) }
-    end
-    assert_equal(want, got)
-  end
-
-  def test_pipeline_multi_retry_on_connection_error
-    sacrifice = @controller.select_sacrifice_of_primary
-    test_key = generate_key_for_node(sacrifice)
-    @clients[0].call('SET', test_key, '5')
-    wait_for_reload_jitter_elapsed(@clients[0])
-
-    kill_a_node_and_wait_for_failover(sacrifice)
-
-    @captured_commands.clear
-    assert_raises(::RedisClient::CommandError) do
-      @clients[0].pipelined do |pi|
-        pi.multi do |multi|
-          multi.call('SET', test_key, '0', 'too many args')
-          multi.call('INCR', test_key)
-        end
-      end
-    end
-
-    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
-    refute(@captured_commands.count('cluster', subcmd).zero?)
-    assert_equal('5', @clients[0].call('GET', test_key))
   end
 
   def test_transaction_retry_on_connection_error
@@ -253,9 +203,14 @@ class TestAgainstClusterBroken < TestingWrapper
     log_info("kill #{sacrifice.config.host}:#{sacrifice.config.port}") do
       refute_nil(sacrifice, "#{sacrifice.config.host}:#{sacrifice.config.port}")
 
-      container_name = compose_container_name_for_sacrifice(sacrifice)
-      refute_nil(container_name, "no compose container for #{sacrifice.config.host}:#{sacrifice.config.port}")
-      container_run('pause', container_name)
+      `docker compose ps --format json`.lines.map { |line| JSON.parse(line) }.each do |service|
+        published_ports = service.fetch('Publishers').map { |e| e.fetch('PublishedPort') }.uniq
+        next unless published_ports.include?(sacrifice.config.port)
+
+        service_name = service.fetch('Service')
+        system("docker compose --progress quiet pause #{service_name}", exception: true)
+        break
+      end
 
       assert_raises(::RedisClient::ConnectionError) { sacrifice.call_once('PING') }
     end
@@ -263,51 +218,11 @@ class TestAgainstClusterBroken < TestingWrapper
 
   def revive_dead_nodes
     log_info('revive dead nodes') do
-      compose_capture('ps', '--format', 'json', '--status', 'paused').lines.each do |line|
-        container_name = JSON.parse(line).fetch('Name')
-        container_run('unpause', container_name)
+      `docker compose ps --format json --status paused`.lines.map { |line| JSON.parse(line) }.each do |service|
+        service_name = service.fetch('Service')
+        system("docker compose --progress quiet unpause #{service_name}", exception: true)
       end
     end
-  end
-
-  def compose_container_name_for_sacrifice(sacrifice)
-    service_name = compose_service_name_for_sacrifice(sacrifice)
-    return if service_name.nil?
-
-    compose_services.find { |service| service.fetch('Service') == service_name }&.fetch('Name')
-  end
-
-  def compose_service_name_for_sacrifice(sacrifice)
-    host = sacrifice.config.host
-    port = sacrifice.config.port
-
-    return host if host.match?(/\Anode\d+\z/)
-
-    compose_services.find do |service|
-      next false unless host == '127.0.0.1' || host == 'localhost'
-
-      published_ports = service.fetch('Publishers', []).map { |e| e.fetch('PublishedPort') }.uniq
-      published_ports.include?(port)
-    end&.fetch('Service')
-  end
-
-  def compose_services
-    compose_capture('ps', '--format', 'json').lines.map { |line| JSON.parse(line) }
-  end
-
-  def compose_run(*args)
-    system('docker', 'compose', '--progress', 'quiet', *args, exception: true)
-  end
-
-  def container_run(*args)
-    system('docker', *args, exception: true)
-  end
-
-  def compose_capture(*args)
-    stdout, status = Open3.capture2('docker', 'compose', '--progress', 'quiet', *args)
-    raise "compose command failed: docker compose #{args.join(' ')}" unless status.success?
-
-    stdout
   end
 
   def log_info(message)

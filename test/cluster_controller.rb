@@ -98,8 +98,8 @@ class ClusterController
     replica_info.client.call_once('CLUSTER', 'FAILOVER', 'TAKEOVER')
     wait_failover(
       @clients,
-      primary_id: primary_info.id,
-      replica_id: replica_info.id,
+      primary_node_key: primary_info.node_key,
+      replica_node_key: replica_info.node_key,
       max_attempts: @max_attempts
     )
     wait_replication_delay(@clients, replica_size: @replica_size, timeout: @timeout)
@@ -385,13 +385,13 @@ class ClusterController
     end
   end
 
-  def wait_failover(clients, primary_id:, replica_id:, max_attempts:)
+  def wait_failover(clients, primary_node_key:, replica_node_key:, max_attempts:)
     wait_for_state(clients, max_attempts: max_attempts) do |client|
       rows = fetch_cluster_nodes(client)
       rows = parse_cluster_nodes(rows)
-      old_primary = rows.find { |r| r.id == primary_id }
-      old_replica = rows.find { |r| r.id == replica_id }
-      !old_primary.nil? && !old_replica.nil? && old_primary.replica? && old_replica.primary?
+      primary_info = rows.find { |r| r.node_key == primary_node_key || r.client_node_key == primary_node_key }
+      replica_info = rows.find { |r| r.node_key == replica_node_key || r.client_node_key == replica_node_key }
+      primary_info.replica? && replica_info.primary?
     rescue ::RedisClient::ConnectionError
       true
     end
