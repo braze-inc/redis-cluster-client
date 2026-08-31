@@ -85,8 +85,7 @@ services:
     user: "0:0"
     volumes:
       - .:/client
-      # macOS Podman Machine: export PODMAN_SOCKET=/run/user/$(podman machine ssh id -u)/podman/podman.sock
-      - /run/user/503/podman/podman.sock:/var/run/podman/podman.sock
+      - ${CONTAINER_SOCKET_HOST_PATH:-/var/run/docker.sock}:/var/run/docker.sock
     command:
       - ruby
       - "-e"
