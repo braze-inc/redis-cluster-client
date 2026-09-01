@@ -29,6 +29,7 @@ class TestAgainstClusterBroken < TestingWrapper
   def teardown
     @logger.info('teardown: test')
     revive_dead_nodes
+    wait_for_cluster_to_be_ready
     @clients&.each(&:close)
     @controller&.close
   end
@@ -97,6 +98,36 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal(want, got)
   end
 
+  def test_pipelined_transaction_redirects_on_moved_after_node_pause
+    key = 'tx_redirect_shutdown_key'
+    @clients[0].call('SET', key, 'seed')
+    wait_for_replication(@clients[0])
+
+    slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
+    src, dest = @controller.select_resharding_target(slot)
+    client = build_client
+
+    assert_equal('seed', client.call('GET', key), 'prime client topology before slot migration')
+    wait_for_reload_jitter_elapsed(client)
+
+    @controller.start_resharding(slot: slot, src_node_key: src, dest_node_key: dest)
+    @controller.finish_resharding(slot: slot, src_node_key: src, dest_node_key: dest)
+    kill_a_node(cluster_node_row(src).client)
+
+    got = client.pipelined do |pipeline|
+      pipeline.multi do |multi|
+        multi.call('SET', key, '0')
+        multi.call('INCR', key)
+      end
+    end
+
+    assert_instance_of(Array, got[0], 'pipelined multi result must be an EXEC array, not a scalar reply')
+    assert_equal(['OK', 1], got[0])
+    assert_equal('1', client.call('GET', key))
+  ensure
+    client&.close
+  end
+
   def test_pipeline_multi_retry_on_connection_error
     sacrifice = @controller.select_sacrifice_of_primary
     test_key = generate_key_for_node(sacrifice)
@@ -106,7 +137,7 @@ class TestAgainstClusterBroken < TestingWrapper
     kill_a_node_and_wait_for_failover(sacrifice)
 
     @captured_commands.clear
-    assert_raises(::RedisClient::CommandError) do
+    err = assert_raises(::RedisClient::Cluster::ErrorCollection) do
       @clients[0].pipelined do |pi|
         pi.multi do |multi|
           multi.call('SET', test_key, '0', 'too many args')
@@ -114,10 +145,11 @@ class TestAgainstClusterBroken < TestingWrapper
         end
       end
     end
+    err.errors.each_value { |e| assert_instance_of(::RedisClient::CommandError, e) }
 
     subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
     refute(@captured_commands.count('cluster', subcmd).zero?)
-    assert_equal('5', @clients[0].call('GET', test_key))
+    assert_equal('6', @clients[0].call('GET', test_key))
   end
 
   def test_transaction_retry_on_connection_error
@@ -377,6 +409,11 @@ class TestAgainstClusterBroken < TestingWrapper
 
       sleep 1.0
     end
+  end
+
+  def cluster_node_row(node_key)
+    @controller.send(:associate_with_clients_and_nodes, @controller.clients)
+               .find { |info| info.node_key == node_key || info.client_node_key == node_key }
   end
 
   def build_client(
