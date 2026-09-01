@@ -399,11 +399,16 @@ class RedisClient
             next if redirected_segments.include?(segment_key)
 
             redirected_segments.add(segment_key)
-            inner_index = connection_error_redirection_index(pipeline, segment)
+            inner_index = segment.find { |i| @router.find_slot(pipeline.get_command(i)) }
+            next if inner_index.nil?
           end
 
           command = pipeline.get_command(inner_index)
-          new_node_key = @router.find_node_key(command, seed: @seed)
+          new_node_key = if segment
+                           @router.find_primary_node_key(command)
+                         else
+                           @router.find_node_key(command, seed: @seed)
+                         end
           next if new_node_key.nil?
 
           slot = slot_for_redirection(pipeline, inner_index, node_key)
@@ -412,15 +417,6 @@ class RedisClient
         end
 
         redirection
-      end
-
-      def connection_error_redirection_index(pipeline, segment)
-        segment.each do |i|
-          new_node_key = @router.find_node_key(pipeline.get_command(i), seed: @seed)
-          return i unless new_node_key.nil?
-        end
-
-        segment.begin
       end
 
       def slot_for_redirection(pipeline, inner_index, node_key)
