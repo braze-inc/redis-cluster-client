@@ -412,7 +412,7 @@ class RedisClient
           next if new_node_key.nil?
 
           slot = slot_for_redirection(pipeline, inner_index, node_key)
-          redirection.replies[inner_index] = ::RedisClient::CommandError.new("MOVED #{slot} #{new_node_key}")
+          redirection.replies[inner_index] = ::RedisClient::CommandError.new("ASK #{slot} #{new_node_key}")
           redirection.indices << inner_index
         end
 
