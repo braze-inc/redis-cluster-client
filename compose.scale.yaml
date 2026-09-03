@@ -77,3 +77,30 @@ services:
         condition: service_healthy
       node8:
         condition: service_healthy
+  ruby:
+    build:
+      context: ./test/ruby
+    restart: always
+    working_dir: /client
+    user: "0:0"
+    volumes:
+      - .:/client
+      - ${CONTAINER_SOCKET_HOST_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+    command:
+      - ruby
+      - "-e"
+      - 'Signal.trap(:INT, "EXIT"); Signal.trap(:TERM, "EXIT"); loop { sleep 1 }'
+    environment:
+      REDIS_HOST: node1
+      CONTAINER_HOST: unix:///var/run/docker.sock
+      DOCKER_HOST: unix:///var/run/docker.sock
+      COMPOSE_FILE: compose.scale.yaml
+    security_opt:
+      - label=disable
+    healthcheck:
+      test: ["CMD", "ruby", "-e", "'puts 1'"]
+      interval: "5s"
+      timeout: "3s"
+      retries: 3
+    profiles:
+      - ruby

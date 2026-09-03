@@ -104,8 +104,18 @@ module TestAgainstClusterScale
     end
 
     def build_additional_node_urls
-      max = TEST_REDIS_PORTS.max
-      (max + 1..max + 2).map { |port| "#{TEST_REDIS_SCHEME}://#{TEST_REDIS_HOST}:#{port}" }
+      case TEST_REDIS_HOST
+      when '127.0.0.1', 'localhost'
+        max = TEST_REDIS_PORTS.max
+        (max + 1..max + 2).map { |port| "#{TEST_REDIS_SCHEME}://#{TEST_REDIS_HOST}:#{port}" }
+      when 'node1'
+        2.times.map do |i|
+          host = "node#{TEST_NUMBER_OF_NODES + i + 1}"
+          "#{TEST_REDIS_SCHEME}://#{host}:#{TEST_REDIS_PORT}"
+        end
+      else
+        raise NotImplementedError, TEST_REDIS_HOST
+      end
     end
 
     def retryable(attempts:)

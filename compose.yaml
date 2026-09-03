@@ -1,4 +1,6 @@
 ---
+name: redis-cluster-client
+
 services:
   node1: &node
     image: "redis:${REDIS_VERSION:-8}"
@@ -66,19 +68,24 @@ services:
       node6:
         condition: service_healthy
   ruby:
-    image: "ruby:${RUBY_VERSION:-4}"
+    build:
+      context: ./test/ruby
     restart: always
     working_dir: /client
+    user: "0:0"
     volumes:
       - .:/client
+      - ${CONTAINER_SOCKET_HOST_PATH:-/var/run/docker.sock}:/var/run/docker.sock
     command:
       - ruby
       - "-e"
       - 'Signal.trap(:INT, "EXIT"); Signal.trap(:TERM, "EXIT"); loop { sleep 1 }'
     environment:
       REDIS_HOST: node1
-    cap_drop:
-      - ALL
+      CONTAINER_HOST: unix:///var/run/docker.sock
+      DOCKER_HOST: unix:///var/run/docker.sock
+    security_opt:
+      - label=disable
     healthcheck:
       test: ["CMD", "ruby", "-e", "'puts 1'"]
       interval: "5s"
