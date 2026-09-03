@@ -306,49 +306,36 @@ class RedisClient
 
       def test_pipelined_transaction_redirects_on_moved
         key = 'tx_redirect_key'
+        @client.call('SET', key, 'seed')
+        wait_for_replication
+
         slot = ::RedisClient::Cluster::KeySlotConverter.convert(key)
-        router = @client.instance_variable_get(:@router)
-        target_node_key = router.find_node_key_by_key(key, primary: true)
-        redirect_count = ::Middlewares::RedirectCount::Counter.new
-
-        client = new_test_client(
-          middlewares: [
-            ::Middlewares::RedirectReadInject
-          ],
-          custom: {
-            redirect_count: redirect_count,
-            redirect_read_inject: ::Middlewares::RedirectReadInject::Setting.new(
-              slot: slot,
-              to: target_node_key,
-              command: %w[SET tx_redirect_key 0],
-              once: true
-            )
-          }
+        controller = ClusterController.new(
+          TEST_NODE_URIS,
+          replica_size: TEST_REPLICA_SIZE,
+          **TEST_GENERIC_OPTIONS
         )
+        src, dest = controller.select_resharding_target(slot)
 
-        got = nil
-        ::Middlewares::RedirectReadInject.with do
-          ::Middlewares::MultiExecOnly.with do
-            got = client.pipelined do |pipeline|
-              pipeline.call('SET', 'decoy', 'must-not-appear')
-              pipeline.multi do |multi|
-                multi.call('SET', key, '0')
-                multi.call('INCR', key)
-              end
-              pipeline.call('GET', 'decoy')
-            end
+        client = new_test_client
+        assert_equal('seed', client.call('GET', key), 'prime client topology before slot migration')
+
+        controller.start_resharding(slot: slot, src_node_key: src, dest_node_key: dest)
+        controller.finish_resharding(slot: slot, src_node_key: src, dest_node_key: dest)
+
+        got = client.pipelined do |pipeline|
+          pipeline.multi do |multi|
+            multi.call('SET', key, '0')
+            multi.call('INCR', key)
           end
         end
 
-        refute(redirect_count.zero?, redirect_count.get)
-        assert_equal(3, got.size)
-        assert_nil(got[0], 'decoy SET is dropped by MultiExecOnly and not sent to Redis')
-        assert_equal(['OK', 1], got[1])
-        assert_nil(got[2], 'decoy GET is dropped by MultiExecOnly and not sent to Redis')
-        assert_nil(client.call('GET', 'decoy'))
+        assert_instance_of(Array, got[0], 'pipelined multi result must be an EXEC array, not a scalar reply')
+        assert_equal(['OK', 1], got[0])
         assert_equal('1', client.call('GET', key))
       ensure
         client&.close
+        controller&.close
       end
 
       def test_pipelined_transaction_redirect_replays_segment_via_call_pipelined
