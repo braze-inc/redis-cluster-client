@@ -174,7 +174,77 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal 2, call_count
   end
 
+  def test_pipeline_connection_error_raises_when_both_targets_down
+    client, test_key = setup_pipeline_connection_error_both_targets_down
+
+    assert_raises(::RedisClient::CannotConnectError) do
+      client.pipelined(exception: true) { |pi| pi.call('GET', test_key) }
+    end
+  ensure
+    client&.close
+  end
+
+  def test_pipeline_connection_error_returns_error_when_both_targets_down
+    client, test_key = setup_pipeline_connection_error_both_targets_down
+
+    got = client.pipelined(exception: false) { |pi| pi.call('GET', test_key) }
+
+    assert_equal(1, got.size)
+    assert_instance_of(::RedisClient::CannotConnectError, got[0])
+  ensure
+    client&.close
+  end
+
+  def test_pipeline_multi_connection_error_raises_when_both_targets_down
+    client, test_key = setup_pipeline_connection_error_both_targets_down
+
+    assert_raises(::RedisClient::CannotConnectError) do
+      client.pipelined(exception: true) do |pi|
+        pi.multi do |multi|
+          multi.call('GET', test_key)
+        end
+      end
+    end
+  ensure
+    client&.close
+  end
+
+  def test_pipeline_multi_connection_error_returns_error_when_both_targets_down
+    client, test_key = setup_pipeline_connection_error_both_targets_down
+
+    got = client.pipelined(exception: false) do |pi|
+      pi.multi do |multi|
+        multi.call('GET', test_key)
+      end
+    end
+
+    assert_equal(1, got.size)
+    assert_instance_of(::RedisClient::CannotConnectError, got[0])
+  ensure
+    client&.close
+  end
+
   private
+
+  def setup_pipeline_connection_error_both_targets_down
+    primary = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(primary)
+    primary.call('SET', test_key, 'value')
+    wait_for_replication(@clients[0])
+    wait_for_reload_jitter_elapsed(@clients[0])
+
+    client = build_client
+    client.call('echo', 'init')
+    wait_for_reload_jitter_elapsed(client)
+
+    ask_target_key = client.send(:router).find_node_key(['GET', test_key])
+    ask_target = cluster_node_row(ask_target_key).client
+
+    kill_a_node(primary)
+    kill_a_node(ask_target)
+
+    [client, test_key]
+  end
 
   def prepare_test_data
     client = build_client(custom: nil, middlewares: nil)

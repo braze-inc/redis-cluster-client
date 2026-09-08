@@ -375,7 +375,8 @@ class RedisClient
           try_redirection(node_key, node, pipeline, inner_index)
         elsif err.message.start_with?('ASK')
           node = @router.assign_asking_node(err.message)
-          try_asking(node) ? try_redirection(node_key, node, pipeline, inner_index) : err
+          asking = try_asking(node, err: err)
+          asking == true ? try_redirection(node_key, node, pipeline, inner_index) : asking
         else
           err
         end
@@ -465,10 +466,14 @@ class RedisClient
         end
       end
 
-      def try_asking(node)
-        node.call('asking') == 'OK'
-      rescue StandardError
-        false
+      def try_asking(node, err:)
+        return true if @router.handle_redirection(node, nil, retry_count: 3) { |n| n.call('asking') } == 'OK'
+
+        raise err if @exception
+        err
+      rescue StandardError => connection_error
+        raise connection_error if @exception
+        connection_error
       end
     end
   end
