@@ -1045,14 +1045,14 @@ class RedisClient
         refute(yielded, 'block should not be yielded while throttled after a failure')
       end
 
-      def test_try_lazy_connect_sets_deferred_topology_renewal_flag
+      def test_find_by_lazy_connect_sets_deferred_topology_renewal_flag
         replica_info = @test_node_info_list.find(&:replica?)
         replica_key = replica_info.node_key
         topology = @test_node.instance_variable_get(:@topology)
 
         refute(topology.clients.key?(replica_key), 'replica should not be connected before lazy connect')
 
-        @test_node.send(:try_lazy_connect, replica_key)
+        @test_node.find_by(replica_key)
 
         assert(topology.clients.key?(replica_key), 'lazy connect should add replica to topology')
         assert(

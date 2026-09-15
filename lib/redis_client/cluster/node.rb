@@ -118,7 +118,7 @@ class RedisClient
       end
 
       def each(&block)
-        @topology.clients.each_value(&block)
+        snapshot_clients(@topology.clients).each_value(&block)
       end
 
       def sample
@@ -132,13 +132,12 @@ class RedisClient
       def find_by(node_key)
         raise ReloadNeeded if node_key.nil?
 
-        unless @topology.clients.key?(node_key)
-          try_lazy_connect(node_key)
+        @mutex.synchronize do
+          try_lazy_connect(node_key) unless @topology.clients.key?(node_key)
+          raise ReloadNeeded unless @topology.clients.key?(node_key)
+
+          @topology.clients.fetch(node_key)
         end
-
-        raise ReloadNeeded unless @topology.clients.key?(node_key)
-
-        @topology.clients.fetch(node_key)
       end
 
       def call_all(method, command, args, &block)
@@ -247,6 +246,10 @@ class RedisClient
         # Connection failed — let find_by raise ReloadNeeded as before
       end
 
+      def snapshot_clients(clients)
+        clients.frozen? ? clients : @mutex.synchronize { clients.dup }
+      end
+
       def make_topology_class(with_replica, replica_affinity)
         if with_replica && replica_affinity == :random
           ::RedisClient::Cluster::Node::RandomReplica
@@ -302,6 +305,7 @@ class RedisClient
       end
 
       def try_map(clients, &block) # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity
+        clients = snapshot_clients(clients)
         return [{}, {}] if clients.empty?
 
         work_group = @concurrent_worker.new_group(size: clients.size)
