@@ -72,6 +72,45 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal 'OK', @clients[0].call('SET', test_key, 'foobar2')
   end
 
+  def test_no_reload_on_moved_after_failover_takeover
+    client = build_client(replica: false)
+    client.call('echo', 'init')
+
+    primary = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(primary)
+    assert_equal('OK', client.call('SET', test_key, 'before'))
+    wait_for_replication(client)
+    wait_for_reload_jitter_elapsed(client)
+
+    primary_id = primary.call('CLUSTER', 'MYID')
+    rows = @controller.send(:associate_with_clients_and_nodes, @controller.clients)
+    replica = rows.find { |r| r.primary_id == primary_id }.client
+    replica_id = replica.call('CLUSTER', 'MYID')
+
+    @controller.send(:wait_replication_delay, @controller.clients, replica_size: TEST_REPLICA_SIZE, timeout: 0.1)
+    replica.call('CLUSTER', 'FAILOVER', 'TAKEOVER')
+    @controller.send(
+      :wait_failover,
+      @controller.clients,
+      primary_id: primary_id,
+      replica_id: replica_id,
+      max_attempts: @controller.instance_variable_get(:@max_attempts)
+    )
+
+    @captured_commands.clear
+    assert_equal('OK', client.call('SET', test_key, 'after'))
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    assert_equal(
+      0,
+      @captured_commands.count('cluster', subcmd),
+      "Expected no CLUSTER #{subcmd.upcase} reload after MOVED to promoted replica"
+    )
+    assert_equal('after', client.call('GET', test_key))
+  ensure
+    client&.close
+  end
+
   def test_pipeline_reloading_on_connection_error
     keys = 12.times.map { |i| "pipeline_reload:#{i}" }
 
@@ -489,11 +528,12 @@ class TestAgainstClusterBroken < TestingWrapper
   def build_client(
     custom: { captured_commands: @captured_commands, redirect_count: @redirect_count },
     middlewares: [::Middlewares::CommandCapture, ::Middlewares::RedirectCount],
+    replica: true,
     **opts
   )
     ::RedisClient.cluster(
       nodes: TEST_NODE_URIS,
-      replica: true,
+      replica: replica,
       fixed_hostname: TEST_FIXED_HOSTNAME,
       custom: custom,
       middlewares: middlewares,

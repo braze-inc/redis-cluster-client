@@ -66,6 +66,32 @@ class RedisClient
           got = @test_topology.any_replica_node_key
           assert_includes(@replications.keys, got)
         end
+
+        def test_lazy_connect_preserves_routing_invariants
+          replica_info = @test_node.instance_variable_get(:@node_info).find(&:replica?)
+          replica_key = replica_info.node_key
+          primary_keys = @replications.keys.sort
+
+          refute(@test_topology.clients.key?(replica_key))
+          @test_node.find_by(replica_key)
+
+          assert(@test_topology.clients.key?(replica_key), 'lazy-connected replica should be in clients')
+          refute(@test_topology.instance_variable_get(:@primary_clients).key?(replica_key),
+                 'lazy-connected replica should not be in partitioned primary_clients')
+
+          assert_equal(primary_keys, @test_topology.clients_for_scanning.keys.sort)
+
+          @test_node.clients_for_scanning.each do |client|
+            assert_equal('master', client.call('ROLE').first)
+          end
+
+          @test_node.replica_clients.each do |client|
+            assert_equal('master', client.call('ROLE').first)
+          end
+
+          sample_primary = primary_keys.first
+          assert_equal(sample_primary, @test_topology.find_node_key_of_replica(sample_primary))
+        end
       end
     end
   end

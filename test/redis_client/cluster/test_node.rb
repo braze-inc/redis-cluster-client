@@ -607,20 +607,58 @@ class RedisClient
         end
       end
 
-      def test_find_by
+      def test_find_by_returns_client_for_connected_nodes
         @test_node_info_list.each do |info|
-          msg = "Case: primary only: #{info.node_key}"
-          got = -> { @test_node.find_by(info.node_key) }
-          if info.primary?
-            assert_instance_of(::RedisClient, got.call, msg)
-          else
-            assert_raises(::RedisClient::Cluster::Node::ReloadNeeded, msg, &got)
-          end
+          next unless info.primary?
 
-          msg = "Case: scale read: #{info.node_key}"
-          got = @test_node_with_scale_read.find_by(info.node_key)
-          assert_instance_of(::RedisClient, got, msg)
+          got = @test_node.find_by(info.node_key)
+          assert_instance_of(::RedisClient, got, "Case: primary only: #{info.node_key}")
         end
+
+        @test_node_info_list.each do |info|
+          got = @test_node_with_scale_read.find_by(info.node_key)
+          assert_instance_of(::RedisClient, got, "Case: scale read: #{info.node_key}")
+        end
+      end
+
+      def test_find_by_lazy_connects_replica_in_node_configs
+        replica_info = @test_node_info_list.find(&:replica?)
+        replica_key = replica_info.node_key
+        topology = @test_node.instance_variable_get(:@topology)
+
+        refute(topology.clients.key?(replica_key), 'replica should not be connected before lazy connect')
+        assert(@test_node.instance_variable_get(:@node_configs).key?(replica_key))
+
+        client = @test_node.find_by(replica_key)
+        assert_instance_of(::RedisClient, client)
+        assert(topology.clients.key?(replica_key))
+        assert_equal([%w[HELLO 3]], client.config.connection_prelude)
+      end
+
+      def test_find_by_raises_reload_needed_for_unknown_key
+        assert_raises(::RedisClient::Cluster::Node::ReloadNeeded) do
+          @test_node.find_by('unknown:99999')
+        end
+      end
+
+      def test_find_by_raises_reload_needed_when_lazy_connect_fails
+        replica_info = @test_node_info_list.find(&:replica?)
+        replica_key = replica_info.node_key
+        topology = @test_node.instance_variable_get(:@topology)
+
+        refute(topology.clients.key?(replica_key))
+
+        node_configs = @test_node.instance_variable_get(:@node_configs)
+        @test_node.instance_variable_set(
+          :@node_configs,
+          node_configs.merge(replica_key => { host: '127.0.0.1', port: 1 })
+        )
+
+        assert_raises(::RedisClient::Cluster::Node::ReloadNeeded) do
+          @test_node.find_by(replica_key)
+        end
+
+        refute(topology.clients.key?(replica_key))
       end
 
       def test_call_all
