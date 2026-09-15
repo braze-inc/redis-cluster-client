@@ -129,7 +129,13 @@ class RedisClient
       end
 
       def find_by(node_key)
-        raise ReloadNeeded if node_key.nil? || !@topology.clients.key?(node_key)
+        raise ReloadNeeded if node_key.nil?
+
+        unless @topology.clients.key?(node_key)
+          try_lazy_connect(node_key)
+        end
+
+        raise ReloadNeeded unless @topology.clients.key?(node_key)
 
         @topology.clients.fetch(node_key)
       end
@@ -215,6 +221,17 @@ class RedisClient
       end
 
       private
+
+      def try_lazy_connect(node_key)
+        option = @node_configs&.fetch(node_key, nil)
+        return if option.nil?
+
+        client = @topology.connect_single_node(node_key, option, scale_read: false)
+        client.call_once('ping')
+      rescue StandardError
+        @topology.clients.delete(node_key)&.close
+        # Connection failed — let find_by raise ReloadNeeded as before
+      end
 
       def make_topology_class(with_replica, replica_affinity)
         if with_replica && replica_affinity == :random

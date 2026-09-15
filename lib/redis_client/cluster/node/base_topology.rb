@@ -42,6 +42,16 @@ class RedisClient
           @replica_clients.freeze
         end
 
+        def connect_single_node(node_key, option, scale_read: nil)
+          return @clients[node_key] if @clients.key?(node_key)
+
+          option = option.merge(@client_options)
+          scale_read = scale_read.nil? ? @replica_node_keys.include?(node_key) : scale_read
+          config = ::RedisClient::Cluster::Node::Config.new(scale_read: scale_read, **option)
+          client = @pool.nil? ? config.new_client : config.new_pool(**@pool)
+          @clients[node_key] = client
+        end
+
         private
 
         def disconnect_from_unwanted_nodes(options)
@@ -52,10 +62,7 @@ class RedisClient
 
         def connect_to_new_nodes(options)
           (options.keys - @clients.keys).each do |node_key|
-            option = options[node_key].merge(@client_options)
-            config = ::RedisClient::Cluster::Node::Config.new(scale_read: @replica_node_keys.include?(node_key), **option)
-            client = @pool.nil? ? config.new_client : config.new_pool(**@pool)
-            @clients[node_key] = client
+            connect_single_node(node_key, options[node_key])
           end
         end
 
