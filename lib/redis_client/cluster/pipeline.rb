@@ -196,6 +196,7 @@ class RedisClient
       def execute # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity,Metrics/MethodLength
         return if @pipelines.nil? || @pipelines.empty?
 
+        @router.deferred_renew_cluster_state!
         work_group = @concurrent_worker.new_group(size: @pipelines.size)
 
         @pipelines.each do |node_key, pipeline|

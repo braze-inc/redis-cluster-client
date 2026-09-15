@@ -110,6 +110,7 @@ class RedisClient
         @mutex = Mutex.new
         @next_reload_time = nil
         @random = Random.new
+        @deferred_topology_renewal = false
       end
 
       def inspect
@@ -211,13 +212,25 @@ class RedisClient
       end
 
       def try_reload!
+        reloaded = false
         with_reload_lock do
           with_reload_jitter do
             with_startup_clients(@config.max_startup_sample) do |clients|
               reload!(clients)
+              reloaded = true
             end
           end
         end
+        reloaded
+      end
+
+      def deferred_renew_cluster_state!
+        return unless @deferred_topology_renewal
+        return if @next_reload_time && obtain_current_time < @next_reload_time
+
+        @deferred_topology_renewal = false if try_reload!
+      rescue ::RedisClient::Cluster::InitialSetupError
+        nil
       end
 
       private
@@ -228,6 +241,7 @@ class RedisClient
 
         client = @topology.connect_single_node(node_key, option, scale_read: false)
         client.call_once('ping')
+        @deferred_topology_renewal = true
       rescue StandardError
         @topology.clients.delete(node_key)&.close
         # Connection failed — let find_by raise ReloadNeeded as before
@@ -485,6 +499,7 @@ class RedisClient
         @slots = build_slot_node_mappings(@node_info)
         @replications = build_replication_mappings(@node_info)
         @topology.process_topology_update!(@replications, @node_configs)
+        @deferred_topology_renewal = false
       end
 
       def with_startup_clients(count) # rubocop:disable Metrics/AbcSize
