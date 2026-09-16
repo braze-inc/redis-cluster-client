@@ -556,19 +556,8 @@ class TestAgainstClusterBroken < TestingWrapper
     compose_capture('ps', '--format', 'json').lines.map { |line| JSON.parse(line) }
   end
 
-  def compose_run(*args)
-    system('docker', 'compose', '--progress', 'quiet', *args, exception: true)
-  end
-
   def container_run(*args)
     system('docker', *args, exception: true)
-  end
-
-  def compose_capture(*args)
-    stdout, status = Open3.capture2('docker', 'compose', '--progress', 'quiet', *args)
-    raise "compose command failed: docker compose #{args.join(' ')}" unless status.success?
-
-    stdout
   end
 
   def log_info(message)
