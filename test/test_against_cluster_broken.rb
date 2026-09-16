@@ -195,7 +195,7 @@ class TestAgainstClusterBroken < TestingWrapper
       @captured_commands.count('cluster', subcmd),
       :>=,
       1,
-      "Expected deferred CLUSTER #{subcmd.upcase} renew at start of next pipeline execute"
+      "Expected deferred CLUSTER #{subcmd.upcase} renew before routing next pipeline"
     )
     assert_equal(
       0,
