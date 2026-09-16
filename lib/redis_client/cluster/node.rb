@@ -211,7 +211,7 @@ class RedisClient
         @mutex.unlock if @mutex.owned?
       end
 
-      def try_reload!
+      def try_reload!(wait: false) # rubocop:disable Lint/UnusedMethodArgument
         reloaded = false
         with_reload_lock do
           with_reload_jitter do

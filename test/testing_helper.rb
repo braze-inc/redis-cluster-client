@@ -11,6 +11,7 @@ require 'middlewares/redirect_count'
 require 'middlewares/redirect_read_inject'
 require 'middlewares/redirect_fake'
 require 'middlewares/multi_exec_only'
+require 'middlewares/pool_shutting_down_once'
 
 case ENV.fetch('REDIS_CONNECTION_DRIVER', 'ruby')
 when 'hiredis' then require 'hiredis-client'
