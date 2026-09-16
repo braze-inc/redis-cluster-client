@@ -130,6 +130,8 @@ class RedisClient
         @size = 0
         @multi_exec_indices = Set.new
         @multi_exec_segments = {}
+
+        @router.deferred_renew_cluster_state!
       end
 
       def call(*args, **kwargs, &block)

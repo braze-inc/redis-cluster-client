@@ -607,20 +607,58 @@ class RedisClient
         end
       end
 
-      def test_find_by
+      def test_find_by_returns_client_for_connected_nodes
         @test_node_info_list.each do |info|
-          msg = "Case: primary only: #{info.node_key}"
-          got = -> { @test_node.find_by(info.node_key) }
-          if info.primary?
-            assert_instance_of(::RedisClient, got.call, msg)
-          else
-            assert_raises(::RedisClient::Cluster::Node::ReloadNeeded, msg, &got)
-          end
+          next unless info.primary?
 
-          msg = "Case: scale read: #{info.node_key}"
-          got = @test_node_with_scale_read.find_by(info.node_key)
-          assert_instance_of(::RedisClient, got, msg)
+          got = @test_node.find_by(info.node_key)
+          assert_instance_of(::RedisClient, got, "Case: primary only: #{info.node_key}")
         end
+
+        @test_node_info_list.each do |info|
+          got = @test_node_with_scale_read.find_by(info.node_key)
+          assert_instance_of(::RedisClient, got, "Case: scale read: #{info.node_key}")
+        end
+      end
+
+      def test_find_by_lazy_connects_replica_in_node_configs
+        replica_info = @test_node_info_list.find(&:replica?)
+        replica_key = replica_info.node_key
+        topology = @test_node.instance_variable_get(:@topology)
+
+        refute(topology.clients.key?(replica_key), 'replica should not be connected before lazy connect')
+        assert(@test_node.instance_variable_get(:@node_configs).key?(replica_key))
+
+        client = @test_node.find_by(replica_key)
+        assert_instance_of(::RedisClient, client)
+        assert(topology.clients.key?(replica_key))
+        assert_equal([%w[HELLO 3]], client.config.connection_prelude)
+      end
+
+      def test_find_by_raises_reload_needed_for_unknown_key
+        assert_raises(::RedisClient::Cluster::Node::ReloadNeeded) do
+          @test_node.find_by('unknown:99999')
+        end
+      end
+
+      def test_find_by_raises_reload_needed_when_lazy_connect_fails
+        replica_info = @test_node_info_list.find(&:replica?)
+        replica_key = replica_info.node_key
+        topology = @test_node.instance_variable_get(:@topology)
+
+        refute(topology.clients.key?(replica_key))
+
+        node_configs = @test_node.instance_variable_get(:@node_configs)
+        @test_node.instance_variable_set(
+          :@node_configs,
+          node_configs.merge(replica_key => { host: '127.0.0.1', port: 1 })
+        )
+
+        assert_raises(::RedisClient::Cluster::Node::ReloadNeeded) do
+          @test_node.find_by(replica_key)
+        end
+
+        refute(topology.clients.key?(replica_key))
       end
 
       def test_call_all
@@ -1005,6 +1043,96 @@ class RedisClient
         yielded = false
         @test_node.send(:with_reload_jitter) { yielded = true }
         refute(yielded, 'block should not be yielded while throttled after a failure')
+      end
+
+      def test_find_by_lazy_connect_sets_deferred_topology_renewal_flag
+        replica_info = @test_node_info_list.find(&:replica?)
+        replica_key = replica_info.node_key
+        topology = @test_node.instance_variable_get(:@topology)
+
+        refute(topology.clients.key?(replica_key), 'replica should not be connected before lazy connect')
+
+        @test_node.find_by(replica_key)
+
+        assert(topology.clients.key?(replica_key), 'lazy connect should add replica to topology')
+        assert(
+          @test_node.instance_variable_get(:@deferred_topology_renewal),
+          'deferred_topology_renewal should be set after successful lazy connect'
+        )
+      end
+
+      def test_deferred_renew_cluster_state_clears_flag_on_success
+        capture_buffer = ::Middlewares::CommandCapture::CommandBuffer.new
+        test_node = make_node(capture_buffer: capture_buffer).tap(&:try_reload!)
+
+        test_node.instance_variable_set(:@deferred_topology_renewal, true)
+        test_node.instance_variable_set(:@next_reload_time, nil)
+
+        capture_buffer.clear
+        test_node.deferred_renew_cluster_state!
+
+        refute(
+          test_node.instance_variable_get(:@deferred_topology_renewal),
+          'deferred_topology_renewal should be cleared after successful reload'
+        )
+
+        subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+        cluster_cmds = capture_buffer.to_a.count { |c| c.command == ['cluster', subcmd] }
+        assert_operator(cluster_cmds, :>=, 1, 'deferred renew should fetch cluster state')
+      end
+
+      def test_deferred_renew_cluster_state_keeps_flag_on_initial_setup_error
+        test_node = make_node.tap(&:try_reload!)
+        test_node.instance_variable_set(:@deferred_topology_renewal, true)
+        test_node.instance_variable_set(:@next_reload_time, nil)
+
+        test_node.define_singleton_method(:try_reload!) do
+          raise ::RedisClient::Cluster::InitialSetupError, 'cluster down'
+        end
+
+        test_node.deferred_renew_cluster_state!
+
+        assert(
+          test_node.instance_variable_get(:@deferred_topology_renewal),
+          'deferred_topology_renewal should remain set when InitialSetupError is raised'
+        )
+      end
+
+      def test_deferred_renew_cluster_state_keeps_flag_when_jitter_throttles
+        test_node = make_node.tap(&:try_reload!)
+        test_node.instance_variable_set(:@deferred_topology_renewal, true)
+        test_node.instance_variable_set(
+          :@next_reload_time,
+          test_node.send(:obtain_current_time) + 1_000_000
+        )
+
+        reload_attempted = false
+        test_node.define_singleton_method(:try_reload!) do
+          reload_attempted = true
+        end
+
+        test_node.deferred_renew_cluster_state!
+
+        refute(reload_attempted, 'try_reload! should not run while jitter throttles')
+        assert(
+          test_node.instance_variable_get(:@deferred_topology_renewal),
+          'deferred_topology_renewal should remain set when jitter throttles reload'
+        )
+      end
+
+      def test_deferred_renew_cluster_state_no_op_when_flag_unset
+        capture_buffer = ::Middlewares::CommandCapture::CommandBuffer.new
+        test_node = make_node(capture_buffer: capture_buffer).tap(&:try_reload!)
+
+        refute(test_node.instance_variable_get(:@deferred_topology_renewal))
+
+        capture_buffer.clear
+        test_node.deferred_renew_cluster_state!
+
+        subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+        cluster_cmds = capture_buffer.to_a.count { |c| c.command == ['cluster', subcmd] }
+        assert_equal(0, cluster_cmds, 'deferred renew should not fetch cluster state when flag is unset')
+        refute(test_node.instance_variable_get(:@deferred_topology_renewal))
       end
     end
     # rubocop:enable Metrics/ClassLength

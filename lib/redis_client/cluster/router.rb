@@ -93,6 +93,7 @@ class RedisClient
       end
 
       def send_command(method, command, *args, &block) # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
+        deferred_renew_cluster_state!
         action = DEDICATED_ACTIONS[command.first]
         return assign_node_and_send_command(method, command, args, &block) if action.nil?
         return send(action.method_name, method, command, args, &block) if action.reply_transformer.nil?
@@ -299,6 +300,10 @@ class RedisClient
         @node.try_reload!
       rescue ::RedisClient::Cluster::InitialSetupError
         # ignore
+      end
+
+      def deferred_renew_cluster_state!
+        @node.deferred_renew_cluster_state!
       end
 
       def close

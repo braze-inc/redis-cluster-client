@@ -72,6 +72,140 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal 'OK', @clients[0].call('SET', test_key, 'foobar2')
   end
 
+  def test_no_reload_on_moved_after_failover_takeover
+    client = build_client(replica: false)
+    client.call('echo', 'init')
+
+    primary = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(primary)
+    assert_equal('OK', client.call('SET', test_key, 'before'))
+    wait_for_replication(client)
+    wait_for_reload_jitter_elapsed(client)
+
+    primary_id = primary.call('CLUSTER', 'MYID')
+    rows = @controller.send(:associate_with_clients_and_nodes, @controller.clients)
+    replica = rows.find { |r| r.primary_id == primary_id }.client
+    replica_id = replica.call('CLUSTER', 'MYID')
+
+    @controller.send(:wait_replication_delay, @controller.clients, replica_size: TEST_REPLICA_SIZE, timeout: 0.1)
+    replica.call('CLUSTER', 'FAILOVER', 'TAKEOVER')
+    @controller.send(
+      :wait_failover,
+      @controller.clients,
+      primary_id: primary_id,
+      replica_id: replica_id,
+      max_attempts: @controller.instance_variable_get(:@max_attempts)
+    )
+
+    @captured_commands.clear
+    assert_equal('OK', client.call('SET', test_key, 'after'))
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    assert_equal(
+      0,
+      @captured_commands.count('cluster', subcmd),
+      "Expected no CLUSTER #{subcmd.upcase} reload after MOVED to promoted replica"
+    )
+    assert_equal('after', client.call('GET', test_key))
+  ensure
+    client&.close
+  end
+
+  def test_no_reload_on_moved_after_failover_takeover_pipeline
+    client = build_client(replica: false)
+    client.call('echo', 'init')
+
+    test_key = setup_failover_takeover(client)
+
+    @captured_commands.clear
+    got = client.pipelined { |pi| pi.call('SET', test_key, 'after') }
+    assert_equal(['OK'], got)
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    assert_equal(
+      0,
+      @captured_commands.count('cluster', subcmd),
+      "Expected no CLUSTER #{subcmd.upcase} reload after MOVED to promoted replica in pipeline"
+    )
+
+    got = client.pipelined { |pi| pi.call('GET', test_key) }
+    assert_equal(['after'], got)
+  ensure
+    client&.close
+  end
+
+  def test_deferred_renew_on_next_command_after_failover_takeover
+    client = build_client(replica: false)
+    client.call('echo', 'init')
+
+    test_key = setup_failover_takeover(client)
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+
+    @captured_commands.clear
+    assert_equal('OK', client.call('SET', test_key, 'after'))
+    assert_equal(
+      0,
+      @captured_commands.count('cluster', subcmd),
+      "Expected no CLUSTER #{subcmd.upcase} reload during MOVED retry on SET"
+    )
+
+    wait_for_reload_jitter_elapsed(client)
+    @captured_commands.clear
+    @redirect_count.clear
+
+    assert_equal('after', client.call('GET', test_key))
+    assert_operator(
+      @captured_commands.count('cluster', subcmd),
+      :>=,
+      1,
+      "Expected deferred CLUSTER #{subcmd.upcase} renew on next GET"
+    )
+    assert_equal(
+      0,
+      @redirect_count.get.moved,
+      'Expected no MOVED redirect after deferred topology renew'
+    )
+  ensure
+    client&.close
+  end
+
+  def test_deferred_renew_on_next_pipeline_after_failover_takeover
+    client = build_client(replica: false)
+    client.call('echo', 'init')
+
+    test_key = setup_failover_takeover(client)
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+
+    @captured_commands.clear
+    got = client.pipelined { |pi| pi.call('SET', test_key, 'after') }
+    assert_equal(['OK'], got)
+    assert_equal(
+      0,
+      @captured_commands.count('cluster', subcmd),
+      "Expected no CLUSTER #{subcmd.upcase} reload during MOVED retry on pipelined SET"
+    )
+
+    wait_for_reload_jitter_elapsed(client)
+    @captured_commands.clear
+    @redirect_count.clear
+
+    got = client.pipelined { |pi| pi.call('GET', test_key) }
+    assert_equal(['after'], got)
+    assert_operator(
+      @captured_commands.count('cluster', subcmd),
+      :>=,
+      1,
+      "Expected deferred CLUSTER #{subcmd.upcase} renew before routing next pipeline"
+    )
+    assert_equal(
+      0,
+      @redirect_count.get.moved,
+      'Expected no MOVED redirect after deferred topology renew in pipeline'
+    )
+  ensure
+    client&.close
+  end
+
   def test_pipeline_reloading_on_connection_error
     keys = 12.times.map { |i| "pipeline_reload:#{i}" }
 
@@ -225,6 +359,31 @@ class TestAgainstClusterBroken < TestingWrapper
   end
 
   private
+
+  def setup_failover_takeover(client)
+    primary = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(primary)
+    assert_equal('OK', client.call('SET', test_key, 'before'))
+    wait_for_replication(client)
+    wait_for_reload_jitter_elapsed(client)
+
+    primary_id = primary.call('CLUSTER', 'MYID')
+    rows = @controller.send(:associate_with_clients_and_nodes, @controller.clients)
+    replica = rows.find { |r| r.primary_id == primary_id }.client
+    replica_id = replica.call('CLUSTER', 'MYID')
+
+    @controller.send(:wait_replication_delay, @controller.clients, replica_size: TEST_REPLICA_SIZE, timeout: 0.1)
+    replica.call('CLUSTER', 'FAILOVER', 'TAKEOVER')
+    @controller.send(
+      :wait_failover,
+      @controller.clients,
+      primary_id: primary_id,
+      replica_id: replica_id,
+      max_attempts: @controller.instance_variable_get(:@max_attempts)
+    )
+
+    test_key
+  end
 
   def setup_pipeline_connection_error_both_targets_down
     primary = @controller.select_sacrifice_of_primary
@@ -489,11 +648,12 @@ class TestAgainstClusterBroken < TestingWrapper
   def build_client(
     custom: { captured_commands: @captured_commands, redirect_count: @redirect_count },
     middlewares: [::Middlewares::CommandCapture, ::Middlewares::RedirectCount],
+    replica: true,
     **opts
   )
     ::RedisClient.cluster(
       nodes: TEST_NODE_URIS,
-      replica: true,
+      replica: replica,
       fixed_hostname: TEST_FIXED_HOSTNAME,
       custom: custom,
       middlewares: middlewares,

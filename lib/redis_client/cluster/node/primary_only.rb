@@ -6,11 +6,14 @@ class RedisClient
   class Cluster
     class Node
       class PrimaryOnly < BaseTopology
-        alias primary_clients clients
-        alias replica_clients clients
+        def primary_clients
+          @primary_clients
+        end
+
+        alias replica_clients primary_clients
 
         def clients_for_scanning(seed: nil) # rubocop:disable Lint/UnusedMethodArgument
-          @clients
+          @primary_clients
         end
 
         def find_node_key_of_replica(primary_node_key, seed: nil) # rubocop:disable Lint/UnusedMethodArgument
