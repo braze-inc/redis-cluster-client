@@ -33,15 +33,15 @@ jobs:
         include:
           - {ruby: '3.4'}
           - {ruby: '4.0'}
-          - {ruby: '3.4', compose: compose.valkey.yaml, redis: '9', replica: '2'}
-          - {ruby: '4.0', compose: compose.valkey.yaml, redis: '9', replica: '2'}
-          - {task: test_cluster_down, compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2'}
-          - {task: test_cluster_broken, compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', restart: 'no', startup: '9'}
-          - {task: test_cluster_state, pattern: 'PrimaryOnly', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'Pooled', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadRandom', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadRandomWithPrimary', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadLatency', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {ruby: '3.4', compose: compose.valkey.yaml, redis: '9'}
+          - {ruby: '4.0', compose: compose.valkey.yaml, redis: '9'}
+          - {task: test_cluster_down, compose: compose.valkey.yaml, redis: '9', ruby: '3.4'}
+          - {task: test_cluster_broken, compose: compose.valkey.yaml, redis: '9', ruby: '3.4', restart: 'no', startup: '6'}
+          - {task: test_cluster_state, pattern: 'PrimaryOnly', compose: compose.valkey.2replica.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'Pooled', compose: compose.valkey.2replica.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadRandom', compose: compose.valkey.2replica.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadRandomWithPrimary', compose: compose.valkey.2replica.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadLatency', compose: compose.valkey.2replica.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
           - {task: test_cluster_scale, pattern: 'Single', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
           - {task: test_cluster_scale, pattern: 'Pipeline', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
           - {task: test_cluster_scale, pattern: 'Transaction', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
