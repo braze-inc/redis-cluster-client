@@ -42,9 +42,8 @@ class TestAgainstClusterDown < TestingWrapper
     end
     wait_for_jobs_to_be_stable
 
-    system('docker compose --progress quiet down', exception: true)
-    system('docker system prune --force --volumes', exception: true, out: File::NULL)
-    system('docker compose --progress quiet up --detach', exception: true)
+    compose_run('down', '--volumes', '--remove-orphans')
+    compose_run('up', '--detach')
     @controller = build_controller
     @controller.wait_for_cluster_to_be_ready
     wait_for_jobs_to_be_stable

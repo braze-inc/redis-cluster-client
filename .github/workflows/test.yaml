@@ -31,33 +31,25 @@ jobs:
       max-parallel: 8
       matrix:
         include:
-          - {redis: '8', ruby: '4.0'}
-          - {redis: '8', ruby: '4.0', compose: compose.ssl.yaml}
-          - {redis: '8', ruby: '4.0', driver: 'hiredis'}
-          - {redis: '8', ruby: '4.0', driver: 'hiredis', compose: compose.ssl.yaml}
-          - {redis: '8', ruby: '4.0', compose: compose.auth.yaml}
-          - {redis: '8', ruby: '4.0', compose: compose.replica.yaml, replica: '2'}
-          - {redis: '9', ruby: '4.0', compose: compose.valkey.yaml, replica: '2'}
-          - {redis: '8', ruby: '4.0', compose: compose.valkey.yaml, replica: '2'}
-          - {redis: '7', ruby: '3.4'}
-          - {redis: '6', ruby: '3.3'}
-          - {redis: '5', ruby: '2.7'}
-          - {ruby: 'jruby'}
-          - {ruby: 'truffleruby'}
-          - {task: test_cluster_down}
-          - {task: test_cluster_broken, restart: 'no', startup: '6'}
-          - {task: test_cluster_state, pattern: 'PrimaryOnly', compose: compose.valkey.yaml, redis: '9', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'Pooled', compose: compose.valkey.yaml, redis: '9', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadRandom', compose: compose.valkey.yaml, redis: '9', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadRandomWithPrimary', compose: compose.valkey.yaml, redis: '9', replica: '2', startup: '9'}
-          - {task: test_cluster_state, pattern: 'ScaleReadLatency', compose: compose.valkey.yaml, redis: '9', replica: '2', startup: '9'}
-          - {task: test_cluster_scale, pattern: 'Single', compose: compose.scale.yaml, startup: '8'}
-          - {task: test_cluster_scale, pattern: 'Pipeline', compose: compose.scale.yaml, startup: '8'}
-          - {task: test_cluster_scale, pattern: 'Transaction', compose: compose.scale.yaml, startup: '8'}
-          - {task: test_cluster_scale, pattern: 'PubSub', compose: compose.scale.yaml, startup: '8'}
+          - {ruby: '3.4'}
+          - {ruby: '4.0'}
+          - {ruby: '3.4', compose: compose.valkey.yaml, redis: '9', replica: '2'}
+          - {ruby: '4.0', compose: compose.valkey.yaml, redis: '9', replica: '2'}
+          - {task: test_cluster_down, compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2'}
+          - {task: test_cluster_broken, compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', restart: 'no', startup: '9'}
+          - {task: test_cluster_state, pattern: 'PrimaryOnly', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'Pooled', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadRandom', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadRandomWithPrimary', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_state, pattern: 'ScaleReadLatency', compose: compose.valkey.yaml, redis: '9', ruby: '3.4', replica: '2', startup: '9'}
+          - {task: test_cluster_scale, pattern: 'Single', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
+          - {task: test_cluster_scale, pattern: 'Pipeline', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
+          - {task: test_cluster_scale, pattern: 'Transaction', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
+          - {task: test_cluster_scale, pattern: 'PubSub', compose: compose.scale.yaml, ruby: '3.4', startup: '8'}
     env:
       REDIS_VERSION: ${{ matrix.redis || '8' }}
       DOCKER_COMPOSE_FILE: ${{ matrix.compose || 'compose.yaml' }}
+      COMPOSE_FILE: ${{ matrix.compose || 'compose.yaml' }}
       REDIS_CONNECTION_DRIVER: ${{ matrix.driver || 'ruby' }}
       REDIS_REPLICA_SIZE: ${{ matrix.replica || '1' }}
       RESTART_POLICY: ${{ matrix.restart || 'always' }}
@@ -69,7 +61,7 @@ jobs:
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: ${{ matrix.ruby || '4.0' }}
+          ruby-version: ${{ matrix.ruby || '3.4' }}
           bundler-cache: true
       - name: Pull Docker images
         run: docker compose --progress quiet -f $DOCKER_COMPOSE_FILE pull

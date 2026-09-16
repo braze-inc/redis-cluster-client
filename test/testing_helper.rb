@@ -2,6 +2,7 @@
 
 # @see https://docs.ruby-lang.org/en/2.1.0/MiniTest/Assertions.html
 
+require 'open3'
 require 'minitest/autorun'
 require 'redis-cluster-client'
 require 'testing_constants'
@@ -22,6 +23,25 @@ MaxRetryExceeded = Class.new(StandardError)
 
 class TestingWrapper < Minitest::Test
   private
+
+  def docker_compose_file
+    ENV.fetch('DOCKER_COMPOSE_FILE', ENV.fetch('COMPOSE_FILE', 'compose.yaml'))
+  end
+
+  def docker_compose_cmd(*args)
+    ['docker', 'compose', '--progress', 'quiet', '-f', docker_compose_file, *args]
+  end
+
+  def compose_run(*args)
+    system(*docker_compose_cmd(*args), exception: true)
+  end
+
+  def compose_capture(*args)
+    stdout, status = Open3.capture2(*docker_compose_cmd(*args))
+    raise "compose command failed: #{docker_compose_cmd(*args).join(' ')}" unless status.success?
+
+    stdout
+  end
 
   def swap_timeout(client, timeout:)
     return if client.nil?
