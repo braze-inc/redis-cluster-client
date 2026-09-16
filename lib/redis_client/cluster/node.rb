@@ -108,6 +108,7 @@ class RedisClient
         @topology = klass.new(pool, @concurrent_worker, **kwargs)
         @config = config
         @mutex = Mutex.new
+        @clients_mutex = Mutex.new
         @next_reload_time = nil
         @random = Random.new
         @deferred_topology_renewal = false
@@ -132,7 +133,7 @@ class RedisClient
       def find_by(node_key)
         raise ReloadNeeded if node_key.nil?
 
-        @mutex.synchronize do
+        @clients_mutex.synchronize do
           try_lazy_connect(node_key) unless @topology.clients.key?(node_key)
           raise ReloadNeeded unless @topology.clients.key?(node_key)
 
@@ -247,7 +248,7 @@ class RedisClient
       end
 
       def snapshot_clients(clients)
-        clients.frozen? ? clients : @mutex.synchronize { clients.dup }
+        clients.frozen? ? clients : @clients_mutex.synchronize { clients.dup }
       end
 
       def make_topology_class(with_replica, replica_affinity)
@@ -496,14 +497,21 @@ class RedisClient
       end
 
       def reload!(clients)
-        @node_info = refetch_node_info_list(clients)
-        @node_configs = @node_info.to_h do |node_info|
+        node_info = refetch_node_info_list(clients)
+        node_configs = node_info.to_h do |node_info|
           [node_info.node_key, @config.client_config_for_node(node_info.node_key)]
         end
-        @slots = build_slot_node_mappings(@node_info)
-        @replications = build_replication_mappings(@node_info)
-        @topology.process_topology_update!(@replications, @node_configs)
-        @deferred_topology_renewal = false
+        slots = build_slot_node_mappings(node_info)
+        replications = build_replication_mappings(node_info)
+
+        @clients_mutex.synchronize do
+          @node_info = node_info
+          @node_configs = node_configs
+          @slots = slots
+          @replications = replications
+          @topology.process_topology_update!(replications, node_configs)
+          @deferred_topology_renewal = false
+        end
       end
 
       def with_startup_clients(count) # rubocop:disable Metrics/AbcSize
@@ -526,7 +534,9 @@ class RedisClient
           # (re-)connect using nodes we already know about.
           # If this is the first time we're connecting to the cluster, we need to seed the topology with the
           # startup clients though.
-          @topology.process_topology_update!({}, @config.startup_nodes) if @topology.clients.empty?
+          if @topology.clients.empty?
+            @clients_mutex.synchronize { @topology.process_topology_update!({}, @config.startup_nodes) }
+          end
           yield @topology.clients.values.sample(count)
         end
       end
