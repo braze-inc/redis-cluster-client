@@ -211,9 +211,9 @@ class RedisClient
         @mutex.unlock if @mutex.owned?
       end
 
-      def try_reload!
+      def try_reload!(wait: false)
         reloaded = false
-        with_reload_lock do
+        with_reload_lock(wait: wait) do
           with_reload_jitter do
             with_startup_clients(@config.max_startup_sample) do |clients|
               reload!(clients)
@@ -551,19 +551,16 @@ class RedisClient
         end
       end
 
-      def with_reload_lock
-        # What should happen with concurrent calls #try_reload! This is a realistic possibility if the cluster goes into
-        # a CLUSTERDOWN state, and we're using a pooled backend. Every thread will independently discover this, and
-        # call #try_reload!.
-        # For now, if a reload is in progress by a thread, the other threads do not wait for that to complete, and
-        # they throw an error.
-        # Probably in the future we should add a circuit breaker to #try_reload! itself, and stop trying if the cluster is
-        # obviously not working.
-        return unless @mutex.try_lock
+      def with_reload_lock(wait: false)
+        if wait
+          @mutex.synchronize { yield }
+        else
+          return unless @mutex.try_lock
 
-        yield
+          yield
+        end
       ensure
-        @mutex.unlock if @mutex.owned?
+        @mutex.unlock if !wait && @mutex.owned?
       end
 
       def obtain_current_time

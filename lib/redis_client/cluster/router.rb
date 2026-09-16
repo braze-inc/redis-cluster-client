@@ -105,9 +105,6 @@ class RedisClient
       rescue ::RedisClient::Cluster::Node::ReloadNeeded
         renew_cluster_state
         raise ::RedisClient::Cluster::NodeMightBeDown.new.with_config(@config)
-      rescue ::RedisClient::ConnectionError
-        renew_cluster_state
-        raise
       rescue ::RedisClient::CommandError => e
         renew_cluster_state if e.message.start_with?('CLUSTERDOWN')
         raise
@@ -118,9 +115,14 @@ class RedisClient
         renew_cluster_state if e.errors.values.any? do |err|
           next false if ::RedisClient::Cluster::ErrorIdentification.identifiable?(err) && @node.none? { |c| ::RedisClient::Cluster::ErrorIdentification.client_owns_error?(err, c) }
 
-          err.message.start_with?('CLUSTERDOWN') || err.is_a?(::RedisClient::ConnectionError)
+          err.message.start_with?('CLUSTERDOWN') || ::RedisClient::Cluster::ErrorIdentification.connection_error?(err)
         end
 
+        raise
+      rescue StandardError => e
+        raise unless ::RedisClient::Cluster::ErrorIdentification.connection_error?(e)
+
+        renew_cluster_state
         raise
       end
 
@@ -164,7 +166,8 @@ class RedisClient
         end
 
         raise
-      rescue ::RedisClient::ConnectionError => e
+      rescue StandardError => e
+        raise unless ::RedisClient::Cluster::ErrorIdentification.connection_error?(e)
         raise unless ::RedisClient::Cluster::ErrorIdentification.client_owns_error?(e, node)
 
         renew_cluster_state
@@ -203,7 +206,9 @@ class RedisClient
         client_index += 1 if result_cursor == 0
 
         [((result_cursor << 8) + client_index).to_s, result_keys]
-      rescue ::RedisClient::ConnectionError
+      rescue StandardError => e
+        raise unless ::RedisClient::Cluster::ErrorIdentification.connection_error?(e)
+
         renew_cluster_state
         raise
       end
@@ -297,7 +302,7 @@ class RedisClient
       end
 
       def renew_cluster_state
-        @node.try_reload!
+        @node.try_reload!(wait: true)
       rescue ::RedisClient::Cluster::InitialSetupError
         # ignore
       end

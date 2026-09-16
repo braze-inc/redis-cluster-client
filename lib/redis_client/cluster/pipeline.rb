@@ -3,6 +3,7 @@
 require 'set'
 require 'redis_client'
 require 'redis_client/cluster/errors'
+require 'redis_client/cluster/error_identification'
 require 'redis_client/cluster/noop_command_builder'
 require 'redis_client/connection_mixin'
 require 'redis_client/middlewares'
@@ -220,7 +221,7 @@ class RedisClient
             cluster_state_errors ||= {}
             cluster_state_errors[node_key] = v
           when StandardError
-            if v.is_a?(::RedisClient::ConnectionError)
+            if ::RedisClient::Cluster::ErrorIdentification.connection_error?(v)
               cluster_state_errors ||= {}
               cluster_connection_errors ||= {}
               cluster_connection_errors[node_key] = v

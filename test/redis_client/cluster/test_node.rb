@@ -1028,6 +1028,50 @@ class RedisClient
         assert_equal MAX_STARTUP_SAMPLE, cluster_node_cmds.size
       end
 
+      def test_try_reload_wait_blocks_until_in_progress_reload_finishes
+        test_node = make_node.tap(&:try_reload!)
+        test_node.instance_variable_set(:@next_reload_time, nil)
+        stall = install_reload_stall!(test_node)
+        threads = []
+
+        waiter_finished = false
+        begin
+          threads << Thread.new { test_node.try_reload!(wait: true) }
+          wait_until_reload_stalled!(stall)
+
+          threads << Thread.new do
+            test_node.try_reload!(wait: true)
+            waiter_finished = true
+          end
+
+          sleep(0.2)
+          refute(waiter_finished, 'wait: true should block until in-progress reload finishes')
+        ensure
+          release_reload_stall!(stall)
+          threads.each { |t| t.join(5) }
+        end
+
+        assert(waiter_finished, 'wait: true should unblock after in-progress reload completes')
+      end
+
+      def test_try_reload_wait_false_does_not_block
+        test_node = make_node.tap(&:try_reload!)
+        test_node.instance_variable_set(:@next_reload_time, nil)
+        stall = install_reload_stall!(test_node)
+        thread_a = nil
+
+        begin
+          thread_a = Thread.new { test_node.try_reload!(wait: true) }
+          wait_until_reload_stalled!(stall)
+
+          result = test_node.try_reload!(wait: false)
+          assert_equal(false, result, 'wait: false should return immediately when reload is in progress')
+        ensure
+          release_reload_stall!(stall)
+          thread_a&.join(5)
+        end
+      end
+
       def test_with_reload_jitter_throttles_after_failure
         @test_node.instance_variable_set(:@next_reload_time, nil)
 
@@ -1133,6 +1177,43 @@ class RedisClient
         cluster_cmds = capture_buffer.to_a.count { |c| c.command == ['cluster', subcmd] }
         assert_equal(0, cluster_cmds, 'deferred renew should not fetch cluster state when flag is unset')
         refute(test_node.instance_variable_get(:@deferred_topology_renewal))
+      end
+
+      private
+
+      def install_reload_stall!(test_node)
+        stall = { entered: false, release: false, mutex: Mutex.new, cv: ConditionVariable.new }
+        original_reload = test_node.method(:reload!)
+
+        test_node.define_singleton_method(:reload!) do |clients|
+          stall[:mutex].synchronize do
+            stall[:entered] = true
+            stall[:cv].broadcast
+            stall[:cv].wait(stall[:mutex]) until stall[:release]
+          end
+          original_reload.call(clients)
+        end
+
+        stall
+      end
+
+      def wait_until_reload_stalled!(stall, timeout: 5)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+        stall[:mutex].synchronize do
+          until stall[:entered]
+            remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            raise 'timed out waiting for reload stall' if remaining <= 0
+
+            stall[:cv].wait(stall[:mutex], remaining)
+          end
+        end
+      end
+
+      def release_reload_stall!(stall)
+        stall[:mutex].synchronize do
+          stall[:release] = true
+          stall[:cv].broadcast
+        end
       end
     end
     # rubocop:enable Metrics/ClassLength

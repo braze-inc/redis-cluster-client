@@ -13,6 +13,11 @@ class RedisClient
         err.is_a?(TaggedError)
       end
 
+      def self.connection_error?(err)
+        err.is_a?(::RedisClient::ConnectionError) ||
+          err.is_a?(::ConnectionPool::PoolShuttingDownError)
+      end
+
       module TaggedError
         attr_accessor :config_instance
 
