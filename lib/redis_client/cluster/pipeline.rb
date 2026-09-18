@@ -240,9 +240,9 @@ class RedisClient
         work_group.close
         @router.renew_cluster_state if cluster_state_errors || cluster_connection_errors
 
-        cluster_connection_errors&.each_key do |node_key|
+        cluster_connection_errors&.each do |node_key, connection_error|
           required_redirections ||= {}
-          required_redirections[node_key] = build_recovery_redirection(node_key)
+          required_redirections[node_key] = build_recovery_redirection(node_key, connection_error)
         end
 
         cluster_state_errors&.each do |node_key, stale|
@@ -434,7 +434,7 @@ class RedisClient
         redirection
       end
 
-      def build_recovery_redirection(node_key)
+      def build_recovery_redirection(node_key, connection_error) # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
         pipeline = @pipelines[node_key]
         redirection = RedirectionNeeded.new
         redirection.replies = Array.new(pipeline._size)
@@ -444,16 +444,22 @@ class RedisClient
         pipeline._size.times do |inner_index|
           segment = find_multi_exec_segment(node_key, inner_index)
           if segment
-            segment_key = [node_key, segment.begin, segment.end]
-            next if redirected_segments.include?(segment_key)
+            next unless redirected_segments.add?([node_key, segment.begin, segment.end])
 
-            redirected_segments.add(segment_key)
             ask_index = segment.find { |i| @router.find_slot(pipeline.get_command(i)) }
-            next if ask_index.nil?
+            next if !ask_index.nil? && assign_recovery_ask!(redirection, node_key, ask_index, primary: true)
 
-            assign_recovery_ask!(redirection, node_key, ask_index, primary: true)
+            # No place to send the segment, so surface the connection error as-is.
+            raise connection_error if @exception
+
+            redirection.replies[segment.end] = connection_error
           else
-            assign_recovery_ask!(redirection, node_key, inner_index, primary: false)
+            next if assign_recovery_ask!(redirection, node_key, inner_index, primary: false)
+
+            # No place to send the command, so surface the connection error as-is.
+            raise connection_error if @exception
+
+            redirection.replies[inner_index] = connection_error
           end
         end
 

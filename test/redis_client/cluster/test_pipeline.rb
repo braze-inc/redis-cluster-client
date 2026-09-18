@@ -319,6 +319,80 @@ class RedisClient
         assert_same(down, err)
       end
 
+      def test_build_recovery_redirection_raises_when_node_key_missing
+        error = connection_error
+        @pipeline.call('SET', 'down-key', '1')
+        drop_routing!
+
+        err = assert_raises(::RedisClient::ConnectionError) do
+          build_recovery_redirection(error)
+        end
+
+        assert_same(error, err)
+      end
+
+      def test_build_recovery_redirection_keeps_error_when_node_key_missing_without_exception
+        pipeline = new_pipeline(exception: false)
+        error = connection_error
+        pipeline.call('SET', 'down-key', '1')
+        drop_routing!
+
+        redirection = build_recovery_redirection(error, pipeline: pipeline)
+
+        assert_empty(redirection.indices)
+        assert_same(error, redirection.replies[0])
+      end
+
+      def test_build_recovery_redirection_raises_when_multi_has_no_slot
+        error = connection_error
+        @pipeline.multi do |tx|
+          tx.call('SET', 'tx-key', '1')
+        end
+        @router.define_singleton_method(:find_slot) { |_command| nil }
+
+        err = assert_raises(::RedisClient::ConnectionError) do
+          build_recovery_redirection(error)
+        end
+
+        assert_same(error, err)
+      end
+
+      def test_build_recovery_redirection_keeps_error_on_multi_exec_reply_without_exception
+        pipeline = new_pipeline(exception: false)
+        error = connection_error
+        pipeline.multi do |tx|
+          tx.call('SET', 'tx-key', '1')
+        end
+        @router.define_singleton_method(:find_slot) { |_command| nil }
+
+        redirection = build_recovery_redirection(error, pipeline: pipeline)
+
+        assert_empty(redirection.indices)
+        # MULTI, SET, EXEC: the EXEC reply is the one surfaced to the caller.
+        assert_same(error, redirection.replies[2])
+      end
+
+      def test_execute_unresolved_connection_error_returns_error_when_exception_false
+        pipeline = new_pipeline(exception: false)
+        error = connection_error
+
+        got = execute_with_connection_error_without_redirect(pipeline, error)
+
+        assert_equal(1, got.size)
+        assert_same(error, got[0])
+      end
+
+      def test_execute_unresolved_connection_error_raises_when_exception_true
+        pipeline = new_pipeline(exception: true)
+        error = connection_error
+
+        err = assert_raises(::RedisClient::ConnectionError) do
+          execute_with_connection_error_without_redirect(pipeline, error)
+        end
+
+        assert_same(error, err)
+      end
+
       private
 
       def new_pipeline(exception:)
@@ -354,6 +428,10 @@ class RedisClient
         sent
       end
 
+      def build_recovery_redirection(error, pipeline: @pipeline)
+        pipeline.send(:build_recovery_redirection, node_key(pipeline), error)
+      end
+
       def drop_routing!
         @router.define_singleton_method(:find_node_key) { |_command, seed: nil| nil } # rubocop:disable Lint/UnusedBlockArgument
         @router.define_singleton_method(:find_primary_node_key) { |_command| nil }
@@ -366,6 +444,17 @@ class RedisClient
         drop_routing!
         pipeline.define_singleton_method(:do_pipelining) do |_cli, _pl|
           raise stale
+        end
+
+        pipeline.execute
+      end
+
+      def execute_with_connection_error_without_redirect(pipeline, error)
+        pipeline.call('SET', 'down-key', '1')
+
+        drop_routing!
+        pipeline.define_singleton_method(:do_pipelining) do |_cli, _pl|
+          raise error
         end
 
         pipeline.execute
@@ -394,6 +483,10 @@ class RedisClient
 
       def moved_error
         ::RedisClient::CommandError.new("MOVED #{SLOT} #{PRIMARY_NODE_KEY}")
+      end
+
+      def connection_error
+        ::RedisClient::ConnectionError.new('Connection refused')
       end
 
       def assert_ask_error(result, node_key:)
