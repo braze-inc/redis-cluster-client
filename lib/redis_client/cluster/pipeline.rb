@@ -82,18 +82,13 @@ class RedisClient
             results[index] = result
           end
 
-          if redirection_indices
+          # A batch can carry both, and the cluster down replies still need a refresh.
+          if redirection_indices || stale_cluster_state
             err = ::RedisClient::Cluster::Pipeline::RedirectionNeeded.new
             err.replies = results
-            err.indices = redirection_indices
+            err.indices = redirection_indices || []
             err.first_exception = first_exception
-            raise err
-          end
-
-          if stale_cluster_state
-            err = ::RedisClient::Cluster::Pipeline::StaleClusterState.new
-            err.replies = results
-            err.first_exception = first_exception
+            err.stale_cluster_state = stale_cluster_state
             raise err
           end
 
@@ -113,12 +108,9 @@ class RedisClient
 
       ReplySizeError = Class.new(::RedisClient::Cluster::Error)
 
-      class StaleClusterState < ::RedisClient::Cluster::Error
-        attr_accessor :replies, :first_exception
-      end
-
+      # Raised for MOVED/ASK replies, and for CLUSTERDOWN replies with an empty +indices+.
       class RedirectionNeeded < ::RedisClient::Cluster::Error
-        attr_accessor :replies, :indices, :first_exception
+        attr_accessor :replies, :indices, :first_exception, :stale_cluster_state
       end
 
       def initialize(router, command_builder, concurrent_worker, exception:, seed: Random.new_seed)
@@ -217,9 +209,10 @@ class RedisClient
           when ::RedisClient::Cluster::Pipeline::RedirectionNeeded
             required_redirections ||= {}
             required_redirections[node_key] = v
-          when ::RedisClient::Cluster::Pipeline::StaleClusterState
-            cluster_state_errors ||= {}
-            cluster_state_errors[node_key] = v
+            if v.stale_cluster_state
+              cluster_state_errors ||= {}
+              cluster_state_errors[node_key] = v
+            end
           when StandardError
             if ::RedisClient::Cluster::ErrorIdentification.connection_error?(v)
               cluster_connection_errors ||= {}
@@ -396,33 +389,45 @@ class RedisClient
         result.is_a?(::RedisClient::CommandError) && result.message.start_with?('CLUSTERDOWN')
       end
 
-      def build_stale_cluster_state_redirection(node_key, stale)
+      def redirection_error?(result)
+        result.is_a?(::RedisClient::CommandError) && result.message.start_with?('MOVED', 'ASK')
+      end
+
+      def build_stale_cluster_state_redirection(node_key, stale) # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity, Metrics/PerceivedComplexity
         pipeline = @pipelines[node_key]
         redirection = RedirectionNeeded.new
         redirection.replies = stale.replies.dup
-        redirection.indices = []
+        # The batch may already need MOVED/ASK redirections, which stay as they are.
+        redirection.indices = stale.indices.dup
         redirection.first_exception =
-          if stale.first_exception && !cluster_down_error?(stale.first_exception)
+          if cluster_down_error?(stale.first_exception)
+            # Only the cluster down error is recoverable, so keep raising anything else in the batch.
+            stale.replies.find { |reply| reply.is_a?(::RedisClient::Error) && !cluster_down_error?(reply) && !redirection_error?(reply) }
+          else
             stale.first_exception
           end
         redirected_segments = Set.new
 
-        stale.replies.each_with_index do |_reply, inner_index|
+        stale.replies.each_index do |inner_index|
           segment = find_multi_exec_segment(node_key, inner_index)
           if segment
-            segment_key = [node_key, segment.begin, segment.end]
-            next if redirected_segments.include?(segment_key)
-            next unless segment.any? { |i| cluster_down_error?(stale.replies[i]) }
+            next unless redirected_segments.add?([node_key, segment.begin, segment.end])
+            # A MOVED/ASK in the segment already retries the whole segment.
+            next if redirection.indices.any? { |i| segment.include?(i) }
 
-            redirected_segments.add(segment_key)
+            error_index = segment.find { |i| cluster_down_error?(stale.replies[i]) }
+            next if error_index.nil?
+
             ask_index = segment.find { |i| @router.find_slot(pipeline.get_command(i)) }
-            next if ask_index.nil?
-
-            assign_recovery_ask!(redirection, node_key, ask_index, primary: true)
+            assigned = !ask_index.nil? && assign_recovery_ask!(redirection, node_key, ask_index, primary: true)
+            # No place to send the segment, so surface the cluster down error as-is.
+            raise stale.replies[error_index] if !assigned && @exception
           else
             next unless cluster_down_error?(stale.replies[inner_index])
 
-            assign_recovery_ask!(redirection, node_key, inner_index, primary: false)
+            assigned = assign_recovery_ask!(redirection, node_key, inner_index, primary: false)
+            # No place to send the command, so surface the cluster down error as-is.
+            raise stale.replies[inner_index] if !assigned && @exception
           end
         end
 
@@ -463,11 +468,12 @@ class RedisClient
                        else
                          @router.find_node_key(command, seed: @seed)
                        end
-        return if new_node_key.nil?
+        return false if new_node_key.nil?
 
         slot = slot_for_redirection(pipeline, inner_index, node_key)
         redirection.replies[inner_index] = ::RedisClient::CommandError.new("ASK #{slot} #{new_node_key}")
         redirection.indices << inner_index
+        true
       end
 
       def slot_for_redirection(pipeline, inner_index, node_key)
