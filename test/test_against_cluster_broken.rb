@@ -19,6 +19,7 @@ class TestAgainstClusterBroken < TestingWrapper
     @captured_commands = ::Middlewares::CommandCapture::CommandBuffer.new
     @redirect_count = ::Middlewares::RedirectCount::Counter.new
     @cluster_down_error_count = 0
+    @cluster_needs_rebuild = false
     @logger = Logger.new($stdout)
     print "\n"
     @logger.info('setup: test')
@@ -28,8 +29,14 @@ class TestAgainstClusterBroken < TestingWrapper
 
   def teardown
     @logger.info('teardown: test')
-    revive_dead_nodes
-    wait_for_cluster_to_be_ready
+    if @cluster_needs_rebuild
+      @controller&.close
+      @controller = build_controller
+      @controller.rebuild
+    else
+      revive_dead_nodes
+      wait_for_cluster_to_be_ready
+    end
     @clients&.each(&:close)
     @controller&.close
   end
@@ -232,6 +239,32 @@ class TestAgainstClusterBroken < TestingWrapper
     assert_equal(want, got)
   end
 
+  def test_pipeline_reloading_on_cluster_down
+    sacrifice = @controller.select_sacrifice_of_primary
+    keys = 12.times.map { generate_key_for_node(sacrifice) }
+
+    keys.each { |key| @clients[0].call('SET', key, 'initial') }
+    wait_for_reload_jitter_elapsed(@clients[0])
+
+    isolate_primary_from_cluster(sacrifice)
+
+    @captured_commands.clear
+    want = keys.map { 'OK' }
+    got = @clients[0].pipelined do |pi|
+      keys.each { |key| pi.call('SET', key, 'updated') }
+    end
+    assert_equal(want, got)
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    refute(@captured_commands.count('cluster', subcmd).zero?)
+
+    want = keys.map { 'updated' }
+    got = @clients[0].pipelined do |pi|
+      keys.each { |key| pi.call('GET', key) }
+    end
+    assert_equal(want, got)
+  end
+
   def test_pipelined_transaction_redirects_on_moved_after_node_pause
     key = 'tx_redirect_shutdown_key'
     @clients[0].call('SET', key, 'seed')
@@ -269,6 +302,30 @@ class TestAgainstClusterBroken < TestingWrapper
     wait_for_reload_jitter_elapsed(@clients[0])
 
     kill_a_node_and_wait_for_failover(sacrifice)
+
+    @captured_commands.clear
+    err = assert_raises(::RedisClient::Cluster::ErrorCollection) do
+      @clients[0].pipelined do |pi|
+        pi.multi do |multi|
+          multi.call('SET', test_key, '0', 'too many args')
+          multi.call('INCR', test_key)
+        end
+      end
+    end
+    err.errors.each_value { |e| assert_instance_of(::RedisClient::CommandError, e) }
+
+    subcmd = TEST_REDIS_MAJOR_VERSION >= 7 ? 'shards' : 'nodes'
+    refute(@captured_commands.count('cluster', subcmd).zero?)
+    assert_equal('6', @clients[0].call('GET', test_key))
+  end
+
+  def test_pipeline_multi_retry_on_cluster_down
+    sacrifice = @controller.select_sacrifice_of_primary
+    test_key = generate_key_for_node(sacrifice)
+    @clients[0].call('SET', test_key, '5')
+    wait_for_reload_jitter_elapsed(@clients[0])
+
+    isolate_primary_from_cluster(sacrifice)
 
     @captured_commands.clear
     err = assert_raises(::RedisClient::Cluster::ErrorCollection) do
@@ -610,6 +667,57 @@ class TestAgainstClusterBroken < TestingWrapper
 
       sleep 1
       failover_checks += 1
+    end
+  end
+
+  # Bring down the sacrifice primary, leaving a degraded but complete cluster:
+  # its replica is promoted via failover and keeps the slots; the old primary is
+  # forgotten + RESET SOFT so it stays up and returns CLUSTERDOWN.
+  # The app client must already hold a stale slot map that still points at the
+  # sacrifice — do not reload it before the assertion.
+  def isolate_primary_from_cluster(sacrifice)
+    log_info("isolate #{sacrifice.config.host}:#{sacrifice.config.port}") do
+      rows = @controller.send(:associate_with_clients_and_nodes, @controller.clients)
+      primary_info = rows.find { |r| r.client.equal?(sacrifice) }
+      refute_nil(primary_info, 'sacrifice must be a known cluster primary')
+
+      replica_info = rows.find { |r| r.primary_id == primary_info.id }
+      refute_nil(replica_info, 'sacrifice primary must have a replica to promote')
+
+      primary = primary_info.client
+      replica = replica_info.client
+      primary_id = primary_info.id
+      replica_id = replica_info.id
+
+      @controller.send(
+        :wait_replication_delay,
+        @controller.clients,
+        replica_size: TEST_REPLICA_SIZE,
+        timeout: 0.1
+      )
+      replica.call_once('CLUSTER', 'FAILOVER', 'TAKEOVER')
+      @controller.send(
+        :wait_failover,
+        @controller.clients,
+        primary_id: primary_id,
+        replica_id: replica_id,
+        max_attempts: @controller.instance_variable_get(:@max_attempts)
+      )
+
+      remaining = @controller.clients.reject { |c| c.equal?(primary) }
+      remaining.each do |cli|
+        cli.call_once('CLUSTER', 'FORGET', primary_id)
+      rescue ::RedisClient::Error
+        # ignore nodes that race during membership churn
+      end
+
+      primary.call_once('CLUSTER', 'RESET', 'SOFT')
+
+      @controller.clients.reject! { |c| c.equal?(primary) }
+      replicas = @controller.instance_variable_get(:@number_of_replicas)
+      @controller.instance_variable_set(:@number_of_replicas, replicas - 1)
+      wait_for_cluster_to_be_ready
+      @cluster_needs_rebuild = true
     end
   end
 

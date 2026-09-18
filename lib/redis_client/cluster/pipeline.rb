@@ -210,7 +210,7 @@ class RedisClient
           end
         end
 
-        all_replies = errors = required_redirections = cluster_state_errors = cluster_connection_errors = nil
+        all_replies = errors = required_redirections = cluster_connection_errors = nil
 
         work_group.each do |node_key, v|
           case v
@@ -218,11 +218,10 @@ class RedisClient
             required_redirections ||= {}
             required_redirections[node_key] = v
           when ::RedisClient::Cluster::Pipeline::StaleClusterState
-            cluster_state_errors ||= {}
-            cluster_state_errors[node_key] = v
+            cluster_connection_errors ||= {}
+            cluster_connection_errors[node_key] = v
           when StandardError
             if ::RedisClient::Cluster::ErrorIdentification.connection_error?(v)
-              cluster_state_errors ||= {}
               cluster_connection_errors ||= {}
               cluster_connection_errors[node_key] = v
             else
@@ -246,11 +245,11 @@ class RedisClient
         end
 
         work_group.close
-        @router.renew_cluster_state if cluster_state_errors || cluster_connection_errors
+        @router.renew_cluster_state if cluster_connection_errors
 
         cluster_connection_errors&.each do |node_key, _connection_error|
           required_redirections ||= {}
-          required_redirections[node_key] = build_connection_error_redirection(node_key)
+          required_redirections[node_key] = build_recovery_redirection(node_key)
         end
 
         required_redirections&.each do |node_key, v|
@@ -285,12 +284,6 @@ class RedisClient
           pipeline.outer_indices.each_with_index { |outer, inner| all_replies[outer] = v.replies[inner] }
         end
 
-        cluster_state_errors&.each do |node_key, v|
-          raise v.first_exception if v.first_exception
-
-          all_replies ||= Array.new(@size)
-          @pipelines[node_key].outer_indices.each_with_index { |outer, inner| all_replies[outer] = v.replies[inner] }
-        end
         raise ::RedisClient::Cluster::ErrorCollection.with_errors(errors).with_config(@router.config) unless errors.nil?
 
         all_replies
@@ -389,7 +382,7 @@ class RedisClient
         (@multi_exec_segments[node_key] || []).find { |segment| segment.include?(inner_index) }
       end
 
-      def build_connection_error_redirection(node_key)
+      def build_recovery_redirection(node_key)
         pipeline = @pipelines[node_key]
         redirection = RedirectionNeeded.new
         redirection.replies = Array.new(pipeline._size)
